@@ -336,7 +336,11 @@ fn capture_thread(
     let mut spresense_fps_calc = SpresenseFpsCalculator::new(30);
 
     let mut frame_count = 0u64;
-    let mut error_count = 0u32;
+
+    // Phase 4.1.1: Separate error counters for better diagnostics
+    let mut packet_error_count = 0u32;        // Serial packet read errors
+    let mut jpeg_decode_error_count = 0u32;   // JPEG decode errors
+    let mut consecutive_jpeg_errors = 0u32;   // Consecutive JPEG errors
     let mut last_stats_time = Instant::now();
     let mut frames_since_last_stats = 0u32;
 
@@ -357,8 +361,8 @@ fn capture_thread(
 
         match read_result {
             Ok(packet) => {
-                // Reset consecutive error count on successful read
-                error_count = 0;
+                // Reset packet error count on successful read
+                packet_error_count = 0;
                 frame_count += 1;
                 frames_since_last_stats += 1;
 
@@ -380,6 +384,9 @@ fn capture_thread(
                 let decode_start = Instant::now();
                 match image::load_from_memory(&packet.jpeg_data) {
                     Ok(img) => {
+                        // Phase 4.1.1: Reset consecutive JPEG errors on success
+                        consecutive_jpeg_errors = 0;
+
                         let decode_time_ms = decode_start.elapsed().as_secs_f32() * 1000.0;
                         total_decode_time_ms += decode_time_ms;
 
@@ -397,8 +404,22 @@ fn capture_thread(
                         }).ok();
                     }
                     Err(e) => {
+                        // Phase 4.1.1: Enhanced JPEG decode error handling
                         error!("Failed to decode JPEG: {}", e);
-                        error_count += 1;
+
+                        // Update error counters
+                        jpeg_decode_error_count += 1;
+                        consecutive_jpeg_errors += 1;
+
+                        // Warn on consecutive errors
+                        if consecutive_jpeg_errors == 5 {
+                            warn!("5 consecutive JPEG decode errors detected - possible Spresense compression issue");
+                        } else if consecutive_jpeg_errors >= 10 {
+                            error!("10+ consecutive JPEG decode errors - check Spresense JPEG encoder");
+                        }
+
+                        // Skip this frame (do not send to GUI, previous frame remains displayed)
+                        // This allows continuous operation despite JPEG errors
                     }
                 }
 
@@ -422,7 +443,7 @@ fn capture_thread(
                         fps,
                         spresense_fps: avg_spresense_fps,
                         frame_count,
-                        errors: error_count,
+                        errors: jpeg_decode_error_count,  // Phase 4.1.1: Show JPEG decode errors only
                         decode_time_ms: avg_decode_time_ms,
                         serial_read_time_ms: avg_serial_read_time_ms,
                         texture_upload_time_ms: 0.0,  // Measured in GUI thread
@@ -439,7 +460,7 @@ fn capture_thread(
                             pc_fps: fps,
                             spresense_fps: avg_spresense_fps,
                             frame_count,
-                            error_count,
+                            error_count: jpeg_decode_error_count,  // Phase 4.1.1: JPEG decode errors
                             decode_time_ms: avg_decode_time_ms,
                             serial_read_time_ms: avg_serial_read_time_ms,
                             texture_upload_time_ms: 0.0,
@@ -461,17 +482,21 @@ fn capture_thread(
             }
             Err(e) => {
                 if e.kind() != std::io::ErrorKind::TimedOut {
-                    error_count += 1;
-                    error!("Packet read error (after recovery attempts): {}", e);
+                    // Phase 4.1.1: Track packet read errors separately
+                    packet_error_count += 1;
+                    error!("Packet read error: {}", e);
 
-                    if error_count >= 10 {
-                        error!("Too many consecutive errors ({}), stopping capture thread", error_count);
-                        tx.send(AppMessage::ConnectionStatus("Too many errors".to_string())).ok();
+                    if packet_error_count >= 10 {
+                        error!("Too many consecutive packet errors ({}), stopping capture thread", packet_error_count);
+                        tx.send(AppMessage::ConnectionStatus("Too many packet errors".to_string())).ok();
                         break;
                     }
 
                     // Brief pause before retry to allow device to recover
                     std::thread::sleep(std::time::Duration::from_millis(10));
+                } else {
+                    // Timeout is not counted as an error (device may be slow)
+                    // Continue to next iteration
                 }
             }
         }
