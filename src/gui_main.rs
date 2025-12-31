@@ -352,7 +352,7 @@ fn capture_thread(
     while *is_running.lock().unwrap() {
         // Measure serial read time
         let read_start = Instant::now();
-        let read_result = serial.read_packet_with_recovery();
+        let read_result = serial.read_packet();
         let serial_read_time_ms = read_start.elapsed().as_secs_f32() * 1000.0;
 
         match read_result {
