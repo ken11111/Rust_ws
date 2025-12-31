@@ -1,9 +1,9 @@
 # Rust build artifacts
-**/target
+/target
 *.pdb
 
 # Test outputs
-**/frames
+/frames
 *.mjpeg
 *.jpg
 diagnostic*.log
@@ -11,7 +11,7 @@ phase4_*.log
 recovery_test.log
 
 # Metrics data
-**/metrics
+/metrics
 *.csv
 
 # Editor/IDE
