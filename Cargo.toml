@@ -1,0 +1,51 @@
+[package]
+name = "security_camera_viewer"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# Serial communication
+serialport = "4.5"
+
+# Byte buffer operations
+bytes = "1.5"
+byteorder = "1.5"
+
+# JPEG image handling
+image = { version = "0.24", features = ["jpeg"] }
+
+# Async runtime (optional for future extensions)
+tokio = { version = "1.35", features = ["full"], optional = true }
+
+# Logging
+log = "0.4"
+env_logger = "0.11"
+
+# Error handling
+anyhow = "1.0"
+thiserror = "1.0"
+
+# CLI argument parsing
+clap = { version = "4.4", features = ["derive"] }
+
+# GUI dependencies
+eframe = { version = "0.27", optional = true }
+egui = { version = "0.27", optional = true }
+egui_extras = { version = "0.27", optional = true, features = ["image"] }
+
+# Time handling for metrics
+chrono = "0.4"
+
+[features]
+default = []
+async = ["tokio"]
+gui = ["eframe", "egui", "egui_extras"]
+
+[[bin]]
+name = "security_camera_viewer"
+path = "src/main.rs"
+
+[[bin]]
+name = "security_camera_gui"
+path = "src/gui_main.rs"
+required-features = ["gui"]

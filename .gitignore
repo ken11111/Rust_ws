@@ -1,0 +1,26 @@
+# Rust build artifacts
+/target
+*.pdb
+
+# Test outputs
+/frames
+*.mjpeg
+*.jpg
+diagnostic*.log
+phase4_*.log
+recovery_test.log
+
+# Metrics data
+/metrics
+*.csv
+
+# Editor/IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
