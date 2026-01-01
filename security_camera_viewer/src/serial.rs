@@ -2,7 +2,11 @@ use serialport::{SerialPort, SerialPortType};
 use std::io::{self, Read};
 use std::time::Duration;
 use log::{debug, info, error};
-use crate::protocol::{MjpegPacket, MjpegHeader, MJPEG_HEADER_SIZE};
+use crate::protocol::{
+    MjpegPacket, MjpegHeader, MetricsPacket, Packet,
+    MJPEG_HEADER_SIZE, SYNC_WORD, METRICS_SYNC_WORD, METRICS_PACKET_SIZE
+};
+use byteorder::{LittleEndian, ReadBytesExt};
 
 pub struct SerialConnection {
     port: Box<dyn SerialPort>,
@@ -107,43 +111,88 @@ impl SerialConnection {
     }
 
 
-    /// Read a complete MJPEG packet from serial port
-    pub fn read_packet(&mut self) -> io::Result<MjpegPacket> {
-        // Read header first (12 bytes)
-        let mut header_buf = [0u8; MJPEG_HEADER_SIZE];
+    /// Read a complete packet from serial port (MJPEG or Metrics)
+    /// Phase 4.1 extension: Returns Packet enum that can be either type
+    pub fn read_packet(&mut self) -> io::Result<Packet> {
+        // Read sync word first (4 bytes) to determine packet type
+        let mut sync_buf = [0u8; 4];
+        self.read_exact(&mut sync_buf)?;
 
-        debug!("Reading MJPEG header ({} bytes)...", MJPEG_HEADER_SIZE);
-        self.read_exact(&mut header_buf)?;
+        let mut cursor = std::io::Cursor::new(&sync_buf);
+        let sync_word = cursor.read_u32::<LittleEndian>()?;
 
-        debug!("Header bytes: {:02X?}", &header_buf[..12]);
+        debug!("Read sync word: 0x{:08X}", sync_word);
 
-        let header = MjpegHeader::parse(&header_buf)?;
+        match sync_word {
+            SYNC_WORD => {
+                // MJPEG packet
+                debug!("Detected MJPEG packet");
 
-        debug!("Parsed header: sync=0x{:08X}, seq={}, jpeg_size={} bytes",
-               header.sync_word, header.sequence, header.jpeg_size);
+                // Read rest of header (8 more bytes: sequence + jpeg_size)
+                let mut rest_header = [0u8; 8];
+                self.read_exact(&mut rest_header)?;
 
-        // Validate JPEG size (additional safety check)
-        if header.jpeg_size > 524288 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("JPEG size too large: {} bytes", header.jpeg_size),
-            ));
+                // Reconstruct full header
+                let mut header_buf = [0u8; MJPEG_HEADER_SIZE];
+                header_buf[0..4].copy_from_slice(&sync_buf);
+                header_buf[4..12].copy_from_slice(&rest_header);
+
+                let header = MjpegHeader::parse(&header_buf)?;
+
+                debug!("MJPEG header: seq={}, jpeg_size={} bytes",
+                       header.sequence, header.jpeg_size);
+
+                // Validate JPEG size
+                if header.jpeg_size > 524288 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("JPEG size too large: {} bytes", header.jpeg_size),
+                    ));
+                }
+
+                // Allocate buffer for complete packet
+                let total_size = header.total_size();
+                let mut packet_buf = vec![0u8; total_size];
+                packet_buf[..MJPEG_HEADER_SIZE].copy_from_slice(&header_buf);
+
+                // Read JPEG data + CRC
+                let remaining_size = header.jpeg_size as usize + 2;
+                self.read_exact(&mut packet_buf[MJPEG_HEADER_SIZE..total_size])?;
+
+                // Parse and verify complete packet
+                let mjpeg_packet = MjpegPacket::parse(&packet_buf)?;
+                Ok(Packet::Mjpeg(mjpeg_packet))
+            }
+
+            METRICS_SYNC_WORD => {
+                // Metrics packet
+                debug!("Detected Metrics packet");
+
+                // Read rest of packet (34 more bytes: METRICS_PACKET_SIZE - 4)
+                let mut packet_buf = [0u8; METRICS_PACKET_SIZE];
+                packet_buf[0..4].copy_from_slice(&sync_buf);
+                self.read_exact(&mut packet_buf[4..METRICS_PACKET_SIZE])?;
+
+                // Parse and verify metrics packet
+                let metrics_packet = MetricsPacket::parse(&packet_buf)?;
+
+                info!("Metrics packet: seq={}, cam_frames={}, usb_pkts={}, q_depth={}, errors={}",
+                      metrics_packet.sequence,
+                      metrics_packet.camera_frames,
+                      metrics_packet.usb_packets,
+                      metrics_packet.action_q_depth,
+                      metrics_packet.errors);
+
+                Ok(Packet::Metrics(metrics_packet))
+            }
+
+            _ => {
+                Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("Unknown sync word: 0x{:08X}", sync_word),
+                ))
+            }
         }
-
-        // Allocate buffer for complete packet
-        let total_size = header.total_size();
-        let mut packet_buf = vec![0u8; total_size];
-
-        // Copy header
-        packet_buf[..MJPEG_HEADER_SIZE].copy_from_slice(&header_buf);
-
-        // Read JPEG data + CRC (jpeg_size + 2 bytes)
-        let remaining_size = header.jpeg_size as usize + 2;
-        debug!("Reading JPEG data + CRC ({} bytes)...", remaining_size);
-        self.read_exact(&mut packet_buf[MJPEG_HEADER_SIZE..total_size])?;
-
-        // Parse and verify complete packet
-        MjpegPacket::parse(&packet_buf)
     }
 
 

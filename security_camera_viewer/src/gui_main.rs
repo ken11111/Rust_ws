@@ -5,6 +5,7 @@ mod metrics;
 use eframe::egui;
 use log::{error, info, warn};
 use serial::SerialConnection;
+use protocol::Packet;
 use metrics::{MetricsLogger, PerformanceMetrics, SpresenseFpsCalculator};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
@@ -25,6 +26,15 @@ enum AppMessage {
         serial_read_time_ms: f32,
         texture_upload_time_ms: f32,
         jpeg_size_kb: f32,  // JPEG size in KB
+    },
+    SpresenseMetrics {  // Phase 4.1: Spresense-side metrics
+        timestamp_ms: u32,
+        camera_frames: u32,
+        camera_fps: f32,
+        usb_packets: u32,
+        action_q_depth: u32,
+        avg_packet_size: u32,
+        errors: u32,
     },
 }
 
@@ -47,6 +57,12 @@ struct CameraApp {
     serial_read_time_ms: f32,
     texture_upload_time_ms: f32,
     jpeg_size_kb: f32,
+
+    // Phase 4.1: Spresense-side metrics
+    spresense_camera_frames: Option<u32>,
+    spresense_camera_fps: Option<f32>,
+    spresense_action_q_depth: Option<u32>,
+    spresense_errors: Option<u32>,
 
     // Settings
     port_path: String,
@@ -71,6 +87,10 @@ impl CameraApp {
             serial_read_time_ms: 0.0,
             texture_upload_time_ms: 0.0,
             jpeg_size_kb: 0.0,
+            spresense_camera_frames: None,
+            spresense_camera_fps: None,
+            spresense_action_q_depth: None,
+            spresense_errors: None,
             port_path: "/dev/ttyACM0".to_string(),
             auto_detect: true,
         }
@@ -154,6 +174,13 @@ impl CameraApp {
                     self.serial_read_time_ms = serial_read_time_ms;
                     self.texture_upload_time_ms = texture_upload_time_ms;
                     self.jpeg_size_kb = jpeg_size_kb;
+                }
+                AppMessage::SpresenseMetrics { timestamp_ms: _, camera_frames, camera_fps, usb_packets: _, action_q_depth, avg_packet_size: _, errors } => {
+                    // Phase 4.1: Update Spresense-side metrics
+                    self.spresense_camera_frames = Some(camera_frames);
+                    self.spresense_camera_fps = Some(camera_fps);
+                    self.spresense_action_q_depth = Some(action_q_depth);
+                    self.spresense_errors = Some(errors);
                 }
             }
         }
@@ -360,7 +387,8 @@ fn capture_thread(
         let serial_read_time_ms = read_start.elapsed().as_secs_f32() * 1000.0;
 
         match read_result {
-            Ok(packet) => {
+            Ok(Packet::Mjpeg(packet)) => {
+                // MJPEG packet - process as video frame
                 // Reset packet error count on successful read
                 packet_error_count = 0;
                 frame_count += 1;
@@ -479,6 +507,28 @@ fn capture_thread(
                     total_jpeg_size_bytes = 0;
                     last_stats_time = now;
                 }
+            }
+            Ok(Packet::Metrics(metrics)) => {
+                // Phase 4.1: Metrics packet - update Spresense-side metrics
+                packet_error_count = 0;  // Reset on successful read
+
+                // TODO: Calculate Spresense camera FPS from metrics
+                // For now, use a simple calculation based on timestamp delta
+                let camera_fps = 0.0f32;  // Placeholder
+
+                info!("Received Spresense metrics: frames={}, usb_pkts={}, q_depth={}, errors={}",
+                      metrics.camera_frames, metrics.usb_packets,
+                      metrics.action_q_depth, metrics.errors);
+
+                tx.send(AppMessage::SpresenseMetrics {
+                    timestamp_ms: metrics.timestamp_ms,
+                    camera_frames: metrics.camera_frames,
+                    camera_fps,
+                    usb_packets: metrics.usb_packets,
+                    action_q_depth: metrics.action_q_depth,
+                    avg_packet_size: metrics.avg_packet_size,
+                    errors: metrics.errors,
+                }).ok();
             }
             Err(e) => {
                 if e.kind() != std::io::ErrorKind::TimedOut {

@@ -8,6 +8,7 @@ use std::io::Write;
 use std::path::PathBuf;
 use anyhow::{Result, Context};
 use serial::SerialConnection;
+use protocol::Packet;
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
@@ -121,7 +122,7 @@ fn main() -> Result<()> {
         }
 
         match serial.read_packet() {
-            Ok(packet) => {
+            Ok(Packet::Mjpeg(packet)) => {
                 error_count = 0; // Reset error count on success
                 packet_count += 1;
                 frame_count += 1;
@@ -211,6 +212,18 @@ fn main() -> Result<()> {
                           total_bytes as f64 / 1_048_576.0,
                           jpeg_errors);
                 }
+            }
+
+            Ok(Packet::Metrics(metrics)) => {
+                // Phase 4.1: Metrics packets - just log and continue (CLI viewer doesn't display them)
+                error_count = 0; // Reset error count on success
+                packet_count += 1;
+                debug!("Metrics packet: seq={}, cam_frames={}, usb_pkts={}, q_depth={}, errors={}",
+                       metrics.sequence,
+                       metrics.camera_frames,
+                       metrics.usb_packets,
+                       metrics.action_q_depth,
+                       metrics.errors);
             }
 
             Err(e) => {
