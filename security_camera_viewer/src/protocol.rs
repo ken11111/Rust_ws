@@ -7,6 +7,10 @@ pub const MJPEG_HEADER_SIZE: usize = 12; // sync_word(4) + sequence(4) + jpeg_si
 pub const CRC_SIZE: usize = 2;
 pub const MIN_PACKET_SIZE: usize = MJPEG_HEADER_SIZE + CRC_SIZE; // 14 bytes
 
+/// Metrics Protocol Constants (Phase 4.1 extension)
+pub const METRICS_SYNC_WORD: u32 = 0xCAFEBEEF;
+pub const METRICS_PACKET_SIZE: usize = 38; // Total size including CRC
+
 /// MJPEG Packet Header (12 bytes)
 #[derive(Debug, Clone)]
 pub struct MjpegHeader {
@@ -133,6 +137,80 @@ impl MjpegPacket {
 
         has_soi && has_eoi
     }
+}
+
+/// Metrics Packet (Phase 4.1 extension, 38 bytes total)
+#[derive(Debug, Clone)]
+pub struct MetricsPacket {
+    pub sequence: u32,           // Metrics packet sequence number
+    pub timestamp_ms: u32,       // Spresense uptime in milliseconds
+    pub camera_frames: u32,      // Total camera frames captured
+    pub usb_packets: u32,        // Total USB packets sent
+    pub action_q_depth: u32,     // Current action queue depth (0-3)
+    pub avg_packet_size: u32,    // Average MJPEG packet size (bytes)
+    pub errors: u32,             // Total error count
+}
+
+impl MetricsPacket {
+    /// Parse Metrics packet from buffer
+    pub fn parse(buf: &[u8]) -> io::Result<Self> {
+        if buf.len() < METRICS_PACKET_SIZE {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                format!("Buffer too small for metrics packet: {} bytes", buf.len()),
+            ));
+        }
+
+        let mut cursor = Cursor::new(buf);
+
+        // Read and verify sync word
+        let sync_word = cursor.read_u32::<LittleEndian>()?;
+        if sync_word != METRICS_SYNC_WORD {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("Invalid metrics sync word: 0x{:08X}, expected 0x{:08X}",
+                        sync_word, METRICS_SYNC_WORD),
+            ));
+        }
+
+        // Read all fields
+        let sequence = cursor.read_u32::<LittleEndian>()?;
+        let timestamp_ms = cursor.read_u32::<LittleEndian>()?;
+        let camera_frames = cursor.read_u32::<LittleEndian>()?;
+        let usb_packets = cursor.read_u32::<LittleEndian>()?;
+        let action_q_depth = cursor.read_u32::<LittleEndian>()?;
+        let avg_packet_size = cursor.read_u32::<LittleEndian>()?;
+        let errors = cursor.read_u32::<LittleEndian>()?;
+        let _reserved = cursor.read_u32::<LittleEndian>()?; // Reserved field
+        let crc16 = cursor.read_u16::<LittleEndian>()?;
+
+        // Verify CRC (36 bytes: all fields except crc16 itself)
+        let calculated_crc = calculate_crc16_ccitt(&buf[0..36]);
+        if calculated_crc != crc16 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("Metrics CRC mismatch: expected 0x{:04X}, got 0x{:04X}",
+                        crc16, calculated_crc),
+            ));
+        }
+
+        Ok(MetricsPacket {
+            sequence,
+            timestamp_ms,
+            camera_frames,
+            usb_packets,
+            action_q_depth,
+            avg_packet_size,
+            errors,
+        })
+    }
+}
+
+/// Unified Packet type that can be either MJPEG or Metrics
+#[derive(Debug, Clone)]
+pub enum Packet {
+    Mjpeg(MjpegPacket),
+    Metrics(MetricsPacket),
 }
 
 /// Calculate CRC-16-CCITT (Polynomial 0x1021, Initial 0xFFFF)
