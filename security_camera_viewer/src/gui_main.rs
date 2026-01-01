@@ -6,7 +6,7 @@ use eframe::egui;
 use log::{error, info, warn};
 use serial::SerialConnection;
 use protocol::Packet;
-use metrics::{MetricsLogger, PerformanceMetrics, SpresenseFpsCalculator};
+use metrics::{MetricsLogger, PerformanceMetrics, SpresenseFpsCalculator, SpresenseCameraFpsCalculator};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -238,6 +238,26 @@ impl eframe::App for CameraApp {
                 ui.label(format!("🖼 Texture: {:.1}ms", self.texture_upload_time_ms));
                 ui.separator();
                 ui.label(format!("📦 JPEG: {:.1}KB", self.jpeg_size_kb));
+                ui.separator();
+
+                // Phase 4.1: Spresense-side metrics from Metrics packets
+                if let Some(cam_fps) = self.spresense_camera_fps {
+                    ui.label(format!("📷 Cam FPS: {:.1}", cam_fps));
+                } else {
+                    ui.label("📷 Cam FPS: --");
+                }
+                ui.separator();
+                if let Some(q_depth) = self.spresense_action_q_depth {
+                    ui.label(format!("📊 Q Depth: {}", q_depth));
+                } else {
+                    ui.label("📊 Q Depth: --");
+                }
+                ui.separator();
+                if let Some(errors) = self.spresense_errors {
+                    ui.label(format!("⚠ Sp Errors: {}", errors));
+                } else {
+                    ui.label("⚠ Sp Errors: --");
+                }
 
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.hyperlink_to("GitHub", "https://github.com/");
@@ -362,6 +382,9 @@ fn capture_thread(
     // Initialize Spresense FPS calculator (30-frame window)
     let mut spresense_fps_calc = SpresenseFpsCalculator::new(30);
 
+    // Initialize Spresense Camera FPS calculator (from Metrics packets)
+    let mut spresense_camera_fps_calc = SpresenseCameraFpsCalculator::new();
+
     let mut frame_count = 0u64;
 
     // Phase 4.1.1: Separate error counters for better diagnostics
@@ -379,6 +402,13 @@ fn capture_thread(
     let mut avg_serial_read_time_ms = 0.0f32;
     let mut avg_jpeg_size_kb = 0.0f32;
     let mut avg_spresense_fps = 0.0f32;
+
+    // Phase 4.1: Spresense-side metrics (latest values from Metrics packets)
+    let mut spresense_camera_frames = 0u32;
+    let mut spresense_camera_fps = 0.0f32;
+    let mut spresense_usb_packets = 0u32;
+    let mut spresense_action_q_depth = 0u32;
+    let mut spresense_errors = 0u32;
 
     while *is_running.lock().unwrap() {
         // Measure serial read time
@@ -478,7 +508,7 @@ fn capture_thread(
                         jpeg_size_kb: avg_jpeg_size_kb,
                     }).ok();
 
-                    // Log metrics to CSV
+                    // Log metrics to CSV (Phase 4.1: Added Spresense-side metrics)
                     if let Some(ref logger) = metrics_logger {
                         let metrics = PerformanceMetrics {
                             timestamp: std::time::SystemTime::now()
@@ -493,6 +523,12 @@ fn capture_thread(
                             serial_read_time_ms: avg_serial_read_time_ms,
                             texture_upload_time_ms: 0.0,
                             jpeg_size_kb: avg_jpeg_size_kb,
+                            // Phase 4.1: Spresense-side metrics from Metrics packets
+                            spresense_camera_frames,
+                            spresense_camera_fps,
+                            spresense_usb_packets,
+                            action_q_depth: spresense_action_q_depth,
+                            spresense_errors,
                         };
 
                         if let Err(e) = logger.log(&metrics) {
@@ -512,12 +548,18 @@ fn capture_thread(
                 // Phase 4.1: Metrics packet - update Spresense-side metrics
                 packet_error_count = 0;  // Reset on successful read
 
-                // TODO: Calculate Spresense camera FPS from metrics
-                // For now, use a simple calculation based on timestamp delta
-                let camera_fps = 0.0f32;  // Placeholder
+                // Calculate Spresense camera FPS from Metrics packet
+                let camera_fps = spresense_camera_fps_calc.update(metrics.timestamp_ms, metrics.camera_frames);
 
-                info!("Received Spresense metrics: frames={}, usb_pkts={}, q_depth={}, errors={}",
-                      metrics.camera_frames, metrics.usb_packets,
+                // Store latest Spresense metrics for CSV logging
+                spresense_camera_frames = metrics.camera_frames;
+                spresense_camera_fps = camera_fps;
+                spresense_usb_packets = metrics.usb_packets;
+                spresense_action_q_depth = metrics.action_q_depth;
+                spresense_errors = metrics.errors;
+
+                info!("Received Spresense metrics: frames={}, fps={:.1}, usb_pkts={}, q_depth={}, errors={}",
+                      metrics.camera_frames, camera_fps, metrics.usb_packets,
                       metrics.action_q_depth, metrics.errors);
 
                 tx.send(AppMessage::SpresenseMetrics {

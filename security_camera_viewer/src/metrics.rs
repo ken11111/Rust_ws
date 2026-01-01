@@ -16,6 +16,12 @@ pub struct PerformanceMetrics {
     pub serial_read_time_ms: f32, // Serial read time
     pub texture_upload_time_ms: f32, // Texture upload time
     pub jpeg_size_kb: f32,        // JPEG size in KB
+    // Phase 4.1: Spresense-side metrics
+    pub spresense_camera_frames: u32,  // Spresense camera frames captured
+    pub spresense_camera_fps: f32,     // Spresense camera FPS (from Metrics packet)
+    pub spresense_usb_packets: u32,    // Spresense USB packets sent
+    pub action_q_depth: u32,           // Pipeline queue depth (0-3)
+    pub spresense_errors: u32,         // Spresense error count
 }
 
 impl PerformanceMetrics {
@@ -30,6 +36,12 @@ impl PerformanceMetrics {
             serial_read_time_ms: 0.0,
             texture_upload_time_ms: 0.0,
             jpeg_size_kb: 0.0,
+            // Phase 4.1: Spresense-side metrics
+            spresense_camera_frames: 0,
+            spresense_camera_fps: 0.0,
+            spresense_usb_packets: 0,
+            action_q_depth: 0,
+            spresense_errors: 0,
         }
     }
 
@@ -65,11 +77,12 @@ impl MetricsLogger {
 
         let mut file = File::create(&log_path)?;
 
-        // Write CSV header
+        // Write CSV header (Phase 4.1: Added Spresense-side metrics)
         writeln!(
             file,
             "timestamp,pc_fps,spresense_fps,frame_count,error_count,\
-             decode_time_ms,serial_read_time_ms,texture_upload_time_ms,jpeg_size_kb"
+             decode_time_ms,serial_read_time_ms,texture_upload_time_ms,jpeg_size_kb,\
+             spresense_camera_frames,spresense_camera_fps,spresense_usb_packets,action_q_depth,spresense_errors"
         )?;
 
         Ok(Self {
@@ -78,13 +91,13 @@ impl MetricsLogger {
         })
     }
 
-    /// Log a metrics sample to CSV
+    /// Log a metrics sample to CSV (Phase 4.1: Added Spresense-side metrics)
     pub fn log(&self, metrics: &PerformanceMetrics) -> io::Result<()> {
         let mut file = self.file.lock().unwrap();
 
         writeln!(
             file,
-            "{:.3},{:.2},{:.2},{},{},{:.2},{:.2},{:.2},{:.2}",
+            "{:.3},{:.2},{:.2},{},{},{:.2},{:.2},{:.2},{:.2},{},{:.2},{},{},{}",
             metrics.timestamp,
             metrics.pc_fps,
             metrics.spresense_fps,
@@ -94,6 +107,11 @@ impl MetricsLogger {
             metrics.serial_read_time_ms,
             metrics.texture_upload_time_ms,
             metrics.jpeg_size_kb,
+            metrics.spresense_camera_frames,
+            metrics.spresense_camera_fps,
+            metrics.spresense_usb_packets,
+            metrics.action_q_depth,
+            metrics.spresense_errors,
         )?;
 
         file.flush()?;
@@ -114,6 +132,60 @@ pub struct SpresenseFpsCalculator {
     last_timestamp: Option<f64>,
     sequence_window: Vec<(u32, f64)>,  // (sequence, timestamp) pairs
     window_size: usize,
+}
+
+/// Spresense Camera FPS calculator
+///
+/// Calculates Spresense-side camera FPS from Metrics packets
+/// Uses timestamp_ms and camera_frames fields
+pub struct SpresenseCameraFpsCalculator {
+    last_camera_frames: Option<u32>,
+    last_timestamp_ms: Option<u32>,
+}
+
+impl SpresenseCameraFpsCalculator {
+    pub fn new() -> Self {
+        Self {
+            last_camera_frames: None,
+            last_timestamp_ms: None,
+        }
+    }
+
+    /// Update with new Metrics packet data
+    /// Returns Spresense camera FPS
+    pub fn update(&mut self, timestamp_ms: u32, camera_frames: u32) -> f32 {
+        if let (Some(last_frames), Some(last_ts)) = (self.last_camera_frames, self.last_timestamp_ms) {
+            let frame_delta = if camera_frames >= last_frames {
+                camera_frames - last_frames
+            } else {
+                // Handle wraparound (unlikely but possible)
+                (u32::MAX - last_frames) + camera_frames + 1
+            };
+
+            let time_delta_ms = if timestamp_ms >= last_ts {
+                timestamp_ms - last_ts
+            } else {
+                // Handle wraparound
+                (u32::MAX - last_ts) + timestamp_ms + 1
+            };
+
+            let time_delta_sec = time_delta_ms as f32 / 1000.0;
+
+            // Store current values for next calculation
+            self.last_camera_frames = Some(camera_frames);
+            self.last_timestamp_ms = Some(timestamp_ms);
+
+            if time_delta_sec > 0.0 {
+                return frame_delta as f32 / time_delta_sec;
+            }
+        } else {
+            // First call - just store values
+            self.last_camera_frames = Some(camera_frames);
+            self.last_timestamp_ms = Some(timestamp_ms);
+        }
+
+        0.0
+    }
 }
 
 impl SpresenseFpsCalculator {
