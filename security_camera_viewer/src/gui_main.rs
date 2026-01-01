@@ -11,6 +11,26 @@ use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Instant;
+use std::fs::File;
+use std::io::{self, Write};
+use std::path::PathBuf;
+use chrono;
+
+// Phase 3: Recording functionality constants
+const MAX_RECORDING_SIZE: u64 = 1_000_000_000;  // 1 GB
+const RECORDING_DIR: &str = "./recordings";
+
+// Phase 3: Recording state management
+#[derive(Debug, Clone)]
+enum RecordingState {
+    Idle,
+    Recording {
+        filepath: PathBuf,
+        start_time: Instant,
+        frame_count: u32,
+        total_bytes: u64,
+    },
+}
 
 #[derive(Debug, Clone)]
 enum AppMessage {
@@ -36,6 +56,7 @@ enum AppMessage {
         avg_packet_size: u32,
         errors: u32,
     },
+    JpegFrame(Vec<u8>),  // Phase 3: JPEG frame data for recording
 }
 
 struct CameraApp {
@@ -64,6 +85,11 @@ struct CameraApp {
     spresense_action_q_depth: Option<u32>,
     spresense_errors: Option<u32>,
 
+    // Phase 3: Recording functionality
+    recording_state: RecordingState,
+    recording_file: Option<Arc<Mutex<File>>>,
+    recording_dir: PathBuf,
+
     // Settings
     port_path: String,
     auto_detect: bool,
@@ -91,6 +117,9 @@ impl CameraApp {
             spresense_camera_fps: None,
             spresense_action_q_depth: None,
             spresense_errors: None,
+            recording_state: RecordingState::Idle,
+            recording_file: None,
+            recording_dir: PathBuf::from(RECORDING_DIR),
             port_path: "/dev/ttyACM0".to_string(),
             auto_detect: true,
         }
@@ -117,6 +146,92 @@ impl CameraApp {
     fn stop_capture(&mut self) {
         *self.is_running.lock().unwrap() = false;
         self.connection_status = "Stopped".to_string();
+
+        // Phase 3: Auto-stop recording when capture stops
+        if matches!(self.recording_state, RecordingState::Recording { .. }) {
+            if let Err(e) = self.stop_recording() {
+                error!("Failed to auto-stop recording: {}", e);
+            }
+        }
+    }
+
+    // Phase 3: Recording methods
+    fn start_recording(&mut self) -> io::Result<()> {
+        // Check if already recording
+        if matches!(self.recording_state, RecordingState::Recording { .. }) {
+            warn!("Recording already in progress");
+            return Ok(());
+        }
+
+        // Create recording directory if it doesn't exist
+        std::fs::create_dir_all(&self.recording_dir)?;
+
+        // Generate filename with timestamp
+        let now = chrono::Local::now();
+        let filename = format!("recording_{}.mjpeg", now.format("%Y%m%d_%H%M%S"));
+        let filepath = self.recording_dir.join(&filename);
+
+        // Create file
+        let file = File::create(&filepath)?;
+        info!("Started recording to: {:?}", filepath);
+
+        // Update state
+        self.recording_state = RecordingState::Recording {
+            filepath: filepath.clone(),
+            start_time: Instant::now(),
+            frame_count: 0,
+            total_bytes: 0,
+        };
+
+        self.recording_file = Some(Arc::new(Mutex::new(file)));
+
+        Ok(())
+    }
+
+    fn stop_recording(&mut self) -> io::Result<()> {
+        // Check if recording
+        if let RecordingState::Recording { filepath, start_time, frame_count, total_bytes } = &self.recording_state {
+            let duration = start_time.elapsed();
+            info!("Stopped recording: {:?}", filepath);
+            info!("  Duration: {:.1}s", duration.as_secs_f32());
+            info!("  Frames: {}", frame_count);
+            info!("  Size: {:.2} MB", *total_bytes as f32 / 1_000_000.0);
+
+            // Close file
+            self.recording_file = None;
+
+            // Update state
+            self.recording_state = RecordingState::Idle;
+        } else {
+            warn!("No recording in progress");
+        }
+
+        Ok(())
+    }
+
+    fn write_frame(&mut self, jpeg_data: &[u8]) -> io::Result<()> {
+        // Check if recording
+        if let RecordingState::Recording { total_bytes, frame_count, .. } = &mut self.recording_state {
+            // Check size limit
+            if *total_bytes + jpeg_data.len() as u64 > MAX_RECORDING_SIZE {
+                warn!("Recording size limit reached ({} MB), stopping", MAX_RECORDING_SIZE / 1_000_000);
+                self.stop_recording()?;
+                return Ok(());
+            }
+
+            // Write JPEG data to file
+            if let Some(ref file) = self.recording_file {
+                let mut file_guard = file.lock().unwrap();
+                file_guard.write_all(jpeg_data)?;
+                file_guard.flush()?;
+
+                // Update counters
+                *total_bytes += jpeg_data.len() as u64;
+                *frame_count += 1;
+            }
+        }
+
+        Ok(())
     }
 
     fn process_messages(&mut self, ctx: &egui::Context) {
@@ -182,6 +297,12 @@ impl CameraApp {
                     self.spresense_action_q_depth = Some(action_q_depth);
                     self.spresense_errors = Some(errors);
                 }
+                AppMessage::JpegFrame(jpeg_data) => {
+                    // Phase 3: Write JPEG frame to recording file
+                    if let Err(e) = self.write_frame(&jpeg_data) {
+                        error!("Failed to write recording frame: {}", e);
+                    }
+                }
             }
         }
     }
@@ -203,6 +324,7 @@ impl eframe::App for CameraApp {
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     let is_running = *self.is_running.lock().unwrap();
 
+                    // Capture controls
                     if is_running {
                         if ui.button("⏹ Stop").clicked() {
                             self.stop_capture();
@@ -210,6 +332,33 @@ impl eframe::App for CameraApp {
                     } else {
                         if ui.button("▶ Start").clicked() {
                             self.start_capture();
+                        }
+                    }
+
+                    ui.separator();
+
+                    // Phase 3: Recording controls
+                    let is_recording = matches!(self.recording_state, RecordingState::Recording { .. });
+
+                    if is_recording {
+                        if ui.button("⏺ Stop Rec").clicked() {
+                            if let Err(e) = self.stop_recording() {
+                                error!("Failed to stop recording: {}", e);
+                            }
+                        }
+
+                        // Display recording status
+                        if let RecordingState::Recording { start_time, frame_count, total_bytes, .. } = &self.recording_state {
+                            let duration = start_time.elapsed().as_secs();
+                            let size_mb = *total_bytes as f32 / 1_000_000.0;
+                            ui.label(format!("🔴 {}:{:02} | {:.1}MB | {} frames",
+                                           duration / 60, duration % 60, size_mb, frame_count));
+                        }
+                    } else {
+                        if ui.button("⏺ Start Rec").clicked() {
+                            if let Err(e) = self.start_recording() {
+                                error!("Failed to start recording: {}", e);
+                            }
                         }
                     }
 
@@ -437,6 +586,9 @@ fn capture_thread(
                 total_serial_read_time_ms += serial_read_time_ms;
                 let jpeg_size_bytes = packet.jpeg_data.len();
                 total_jpeg_size_bytes += jpeg_size_bytes as u64;
+
+                // Phase 3: Send JPEG data for recording (GUI thread will write if recording active)
+                tx.send(AppMessage::JpegFrame(packet.jpeg_data.clone())).ok();
 
                 // Option A: Decode JPEG in capture thread (not GUI thread)
                 let decode_start = Instant::now();
