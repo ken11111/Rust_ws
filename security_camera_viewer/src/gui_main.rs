@@ -9,6 +9,7 @@ use protocol::Packet;
 use metrics::{MetricsLogger, PerformanceMetrics, SpresenseFpsCalculator, SpresenseCameraFpsCalculator};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::Instant;
 use std::fs::File;
@@ -68,6 +69,7 @@ struct CameraApp {
     current_frame: Option<egui::TextureHandle>,
     connection_status: String,
     is_running: Arc<Mutex<bool>>,
+    is_recording: Arc<AtomicBool>,  // Phase 3: Recording state shared with capture thread
 
     // Statistics
     fps: f32,
@@ -105,6 +107,7 @@ impl CameraApp {
             current_frame: None,
             connection_status: "Not connected".to_string(),
             is_running: Arc::new(Mutex::new(false)),
+            is_recording: Arc::new(AtomicBool::new(false)),
             fps: 0.0,
             spresense_fps: 0.0,
             frame_count: 0,
@@ -135,11 +138,12 @@ impl CameraApp {
 
         let tx = self.tx.clone();
         let is_running = self.is_running.clone();
+        let is_recording = self.is_recording.clone();
         let port_path = self.port_path.clone();
         let auto_detect = self.auto_detect;
 
         thread::spawn(move || {
-            capture_thread(tx, is_running, port_path, auto_detect);
+            capture_thread(tx, is_running, is_recording, port_path, auto_detect);
         });
     }
 
@@ -184,6 +188,7 @@ impl CameraApp {
         };
 
         self.recording_file = Some(Arc::new(Mutex::new(file)));
+        self.is_recording.store(true, Ordering::Relaxed);
 
         Ok(())
     }
@@ -202,6 +207,7 @@ impl CameraApp {
 
             // Update state
             self.recording_state = RecordingState::Idle;
+            self.is_recording.store(false, Ordering::Relaxed);
         } else {
             warn!("No recording in progress");
         }
@@ -223,7 +229,8 @@ impl CameraApp {
             if let Some(ref file) = self.recording_file {
                 let mut file_guard = file.lock().unwrap();
                 file_guard.write_all(jpeg_data)?;
-                file_guard.flush()?;
+                // Note: flush() removed to reduce GUI thread blocking
+                // File will be flushed automatically on close or periodically by OS
 
                 // Update counters
                 *total_bytes += jpeg_data.len() as u64;
@@ -467,6 +474,7 @@ impl eframe::App for CameraApp {
 fn capture_thread(
     tx: Sender<AppMessage>,
     is_running: Arc<Mutex<bool>>,
+    is_recording: Arc<AtomicBool>,
     port_path: String,
     auto_detect: bool,
 ) {
@@ -587,8 +595,11 @@ fn capture_thread(
                 let jpeg_size_bytes = packet.jpeg_data.len();
                 total_jpeg_size_bytes += jpeg_size_bytes as u64;
 
-                // Phase 3: Send JPEG data for recording (GUI thread will write if recording active)
-                tx.send(AppMessage::JpegFrame(packet.jpeg_data.clone())).ok();
+                // Phase 3: Send JPEG data for recording ONLY when recording is active
+                // This prevents message queue congestion and Metrics packet delay
+                if is_recording.load(Ordering::Relaxed) {
+                    tx.send(AppMessage::JpegFrame(packet.jpeg_data.clone())).ok();
+                }
 
                 // Option A: Decode JPEG in capture thread (not GUI thread)
                 let decode_start = Instant::now();
