@@ -24,3 +24,8 @@ recovery_test.log
 # OS files
 .DS_Store
 Thumbs.db
+
+# Release artifacts
+/release
+/windows_release
+/recordings

@@ -1,12 +1,16 @@
 mod protocol;
 mod serial;
 mod metrics;
+mod ring_buffer;
+mod motion_detector;
 
 use eframe::egui;
 use log::{error, info, warn};
 use serial::SerialConnection;
 use protocol::Packet;
 use metrics::{MetricsLogger, PerformanceMetrics, SpresenseFpsCalculator, SpresenseCameraFpsCalculator};
+use ring_buffer::{RingBuffer, JpegFrame};
+use motion_detector::{MotionDetector, MotionDetectionConfig};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -21,15 +25,25 @@ use chrono;
 const MAX_RECORDING_SIZE: u64 = 1_000_000_000;  // 1 GB
 const RECORDING_DIR: &str = "./recordings";
 
-// Phase 3: Recording state management
+// Phase 3/5: Recording state management
 #[derive(Debug, Clone)]
 enum RecordingState {
     Idle,
-    Recording {
+    /// 手動録画 (Phase 3)
+    ManualRecording {
         filepath: PathBuf,
         start_time: Instant,
         frame_count: u32,
         total_bytes: u64,
+    },
+    /// 動き検知録画 (Phase 5)
+    MotionRecording {
+        filepath: PathBuf,
+        start_time: Instant,
+        frame_count: u32,
+        total_bytes: u64,
+        motion_active: bool,           // 現在動き検知中か
+        countdown_frames: u32,         // ポスト録画残りフレーム数
     },
 }
 
@@ -92,6 +106,12 @@ struct CameraApp {
     recording_file: Option<Arc<Mutex<File>>>,
     recording_dir: PathBuf,
 
+    // Phase 5: Motion detection recording
+    motion_config: MotionDetectionConfig,
+    motion_detector: MotionDetector,
+    ring_buffer: RingBuffer,
+    last_motion_time: Option<Instant>,
+
     // Settings
     port_path: String,
     auto_detect: bool,
@@ -123,6 +143,10 @@ impl CameraApp {
             recording_state: RecordingState::Idle,
             recording_file: None,
             recording_dir: PathBuf::from(RECORDING_DIR),
+            motion_config: MotionDetectionConfig::default(),
+            motion_detector: MotionDetector::default(),
+            ring_buffer: RingBuffer::from_seconds(10, 11),  // 10秒@11fps
+            last_motion_time: None,
             port_path: "/dev/ttyACM0".to_string(),
             auto_detect: true,
         }
@@ -151,18 +175,18 @@ impl CameraApp {
         *self.is_running.lock().unwrap() = false;
         self.connection_status = "Stopped".to_string();
 
-        // Phase 3: Auto-stop recording when capture stops
-        if matches!(self.recording_state, RecordingState::Recording { .. }) {
+        // Phase 3/5: Auto-stop recording when capture stops
+        if matches!(self.recording_state, RecordingState::ManualRecording { .. } | RecordingState::MotionRecording { .. }) {
             if let Err(e) = self.stop_recording() {
                 error!("Failed to auto-stop recording: {}", e);
             }
         }
     }
 
-    // Phase 3: Recording methods
-    fn start_recording(&mut self) -> io::Result<()> {
+    // Phase 3/5: Recording methods
+    fn start_manual_recording(&mut self) -> io::Result<()> {
         // Check if already recording
-        if matches!(self.recording_state, RecordingState::Recording { .. }) {
+        if matches!(self.recording_state, RecordingState::ManualRecording { .. } | RecordingState::MotionRecording { .. }) {
             warn!("Recording already in progress");
             return Ok(());
         }
@@ -172,15 +196,15 @@ impl CameraApp {
 
         // Generate filename with timestamp
         let now = chrono::Local::now();
-        let filename = format!("recording_{}.mjpeg", now.format("%Y%m%d_%H%M%S"));
+        let filename = format!("manual_{}.mjpeg", now.format("%Y%m%d_%H%M%S"));
         let filepath = self.recording_dir.join(&filename);
 
         // Create file
         let file = File::create(&filepath)?;
-        info!("Started recording to: {:?}", filepath);
+        info!("Started manual recording to: {:?}", filepath);
 
         // Update state
-        self.recording_state = RecordingState::Recording {
+        self.recording_state = RecordingState::ManualRecording {
             filepath: filepath.clone(),
             start_time: Instant::now(),
             frame_count: 0,
@@ -193,48 +217,101 @@ impl CameraApp {
         Ok(())
     }
 
+    // Phase 5: Motion detection recording
+    fn start_motion_recording(&mut self) -> io::Result<()> {
+        // Check if already recording
+        if matches!(self.recording_state, RecordingState::ManualRecording { .. } | RecordingState::MotionRecording { .. }) {
+            return Ok(());  // Already recording, skip silently
+        }
+
+        // Create recording directory
+        std::fs::create_dir_all(&self.recording_dir)?;
+
+        // Generate filename with timestamp
+        let now = chrono::Local::now();
+        let filename = format!("motion_{}.mjpeg", now.format("%Y%m%d_%H%M%S"));
+        let filepath = self.recording_dir.join(&filename);
+
+        // Create file
+        let mut file = File::create(&filepath)?;
+
+        // Write pre-buffer (10 seconds before motion)
+        let (pre_frames, pre_bytes) = self.ring_buffer.flush_to_file(&mut file)?;
+
+        info!("Started motion recording to: {:?}", filepath);
+        info!("  Pre-buffer: {} frames, {:.2} MB", pre_frames, pre_bytes as f32 / 1_000_000.0);
+
+        // Update state
+        self.recording_state = RecordingState::MotionRecording {
+            filepath: filepath.clone(),
+            start_time: Instant::now(),
+            frame_count: pre_frames as u32,
+            total_bytes: pre_bytes as u64,
+            motion_active: true,
+            countdown_frames: self.motion_config.post_record_seconds * 11,  // 11 fps
+        };
+
+        self.recording_file = Some(Arc::new(Mutex::new(file)));
+        self.is_recording.store(true, Ordering::Relaxed);
+        self.last_motion_time = Some(Instant::now());
+
+        Ok(())
+    }
+
     fn stop_recording(&mut self) -> io::Result<()> {
-        // Check if recording
-        if let RecordingState::Recording { filepath, start_time, frame_count, total_bytes } = &self.recording_state {
-            let duration = start_time.elapsed();
-            info!("Stopped recording: {:?}", filepath);
-            info!("  Duration: {:.1}s", duration.as_secs_f32());
-            info!("  Frames: {}", frame_count);
-            info!("  Size: {:.2} MB", *total_bytes as f32 / 1_000_000.0);
+        // Check if recording (manual or motion)
+        match &self.recording_state {
+            RecordingState::ManualRecording { filepath, start_time, frame_count, total_bytes } |
+            RecordingState::MotionRecording { filepath, start_time, frame_count, total_bytes, .. } => {
+                let duration = start_time.elapsed();
+                let is_motion = matches!(self.recording_state, RecordingState::MotionRecording { .. });
 
-            // Close file
-            self.recording_file = None;
+                info!("Stopped {} recording: {:?}", if is_motion { "motion" } else { "manual" }, filepath);
+                info!("  Duration: {:.1}s", duration.as_secs_f32());
+                info!("  Frames: {}", frame_count);
+                info!("  Size: {:.2} MB", *total_bytes as f32 / 1_000_000.0);
 
-            // Update state
-            self.recording_state = RecordingState::Idle;
-            self.is_recording.store(false, Ordering::Relaxed);
-        } else {
-            warn!("No recording in progress");
+                // Close file
+                self.recording_file = None;
+
+                // Update state
+                self.recording_state = RecordingState::Idle;
+                self.is_recording.store(false, Ordering::Relaxed);
+            }
+            RecordingState::Idle => {
+                warn!("No recording in progress");
+            }
         }
 
         Ok(())
     }
 
     fn write_frame(&mut self, jpeg_data: &[u8]) -> io::Result<()> {
-        // Check if recording
-        if let RecordingState::Recording { total_bytes, frame_count, .. } = &mut self.recording_state {
-            // Check size limit
-            if *total_bytes + jpeg_data.len() as u64 > MAX_RECORDING_SIZE {
-                warn!("Recording size limit reached ({} MB), stopping", MAX_RECORDING_SIZE / 1_000_000);
-                self.stop_recording()?;
-                return Ok(());
+        // Check if recording (manual or motion)
+        match &mut self.recording_state {
+            RecordingState::ManualRecording { total_bytes, frame_count, .. } |
+            RecordingState::MotionRecording { total_bytes, frame_count, .. } => {
+                // Check size limit
+                if *total_bytes + jpeg_data.len() as u64 > MAX_RECORDING_SIZE {
+                    warn!("Recording size limit reached ({} MB), stopping", MAX_RECORDING_SIZE / 1_000_000);
+                    self.stop_recording()?;
+                    return Ok(());
+                }
+
+                // Write JPEG data to file
+                if let Some(ref file) = self.recording_file {
+                    let mut file_guard = file.lock().unwrap();
+                    file_guard.write_all(jpeg_data)?;
+                    // Note: flush() removed to reduce GUI thread blocking
+                    // File will be flushed automatically on close or periodically by OS
+
+                    // Update counters
+                    *total_bytes += jpeg_data.len() as u64;
+                    *frame_count += 1;
+                }
             }
-
-            // Write JPEG data to file
-            if let Some(ref file) = self.recording_file {
-                let mut file_guard = file.lock().unwrap();
-                file_guard.write_all(jpeg_data)?;
-                // Note: flush() removed to reduce GUI thread blocking
-                // File will be flushed automatically on close or periodically by OS
-
-                // Update counters
-                *total_bytes += jpeg_data.len() as u64;
-                *frame_count += 1;
+            RecordingState::Idle => {
+                // Not recording, do nothing
             }
         }
 
@@ -283,6 +360,51 @@ impl CameraApp {
                             egui::TextureOptions::LINEAR,
                         ));
                     }
+
+                    // Phase 5: Motion detection
+                    if self.motion_config.enabled {
+                        use image::RgbaImage;
+
+                        // Convert pixels Vec<u8> to RgbaImage
+                        if let Some(rgba_img) = RgbaImage::from_raw(width, height, pixels) {
+                            // Detect motion
+                            let motion_detected = self.motion_detector.detect(&rgba_img);
+
+                            // Handle motion detection states
+                            match &mut self.recording_state {
+                                RecordingState::Idle => {
+                                    if motion_detected {
+                                        // Start motion recording
+                                        if let Err(e) = self.start_motion_recording() {
+                                            error!("Failed to start motion recording: {}", e);
+                                        }
+                                    }
+                                }
+                                RecordingState::MotionRecording { motion_active, countdown_frames, .. } => {
+                                    if motion_detected {
+                                        // Motion continues - reset countdown
+                                        *motion_active = true;
+                                        *countdown_frames = self.motion_config.post_record_seconds * 11;
+                                        self.last_motion_time = Some(Instant::now());
+                                    } else {
+                                        // No motion - countdown
+                                        *motion_active = false;
+                                        if *countdown_frames > 0 {
+                                            *countdown_frames -= 1;
+                                        } else {
+                                            // Countdown finished - stop recording
+                                            if let Err(e) = self.stop_recording() {
+                                                error!("Failed to stop motion recording: {}", e);
+                                            }
+                                        }
+                                    }
+                                }
+                                RecordingState::ManualRecording { .. } => {
+                                    // Manual recording in progress - don't interfere
+                                }
+                            }
+                        }
+                    }
                 }
                 AppMessage::ConnectionStatus(status) => {
                     self.connection_status = status;
@@ -305,7 +427,15 @@ impl CameraApp {
                     self.spresense_errors = Some(errors);
                 }
                 AppMessage::JpegFrame(jpeg_data) => {
-                    // Phase 3: Write JPEG frame to recording file
+                    // Phase 5: Add to ring buffer (if motion detection enabled)
+                    if self.motion_config.enabled {
+                        self.ring_buffer.push(JpegFrame {
+                            jpeg_data: jpeg_data.clone(),
+                            timestamp: Instant::now(),
+                        });
+                    }
+
+                    // Phase 3/5: Write JPEG frame to recording file
                     if let Err(e) = self.write_frame(&jpeg_data) {
                         error!("Failed to write recording frame: {}", e);
                     }
@@ -317,6 +447,15 @@ impl CameraApp {
 
 impl eframe::App for CameraApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // Phase 5: Sync motion detector config
+        self.motion_detector.update_config(self.motion_config.clone());
+
+        // Update ring buffer capacity if pre_record_seconds changed
+        let expected_capacity = (self.motion_config.pre_record_seconds * 11) as usize;
+        if self.ring_buffer.capacity() != expected_capacity {
+            self.ring_buffer = RingBuffer::from_seconds(self.motion_config.pre_record_seconds, 11);
+        }
+
         // Process incoming messages
         self.process_messages(ctx);
 
@@ -344,8 +483,9 @@ impl eframe::App for CameraApp {
 
                     ui.separator();
 
-                    // Phase 3: Recording controls
-                    let is_recording = matches!(self.recording_state, RecordingState::Recording { .. });
+                    // Phase 3/5: Recording controls
+                    let is_recording = matches!(self.recording_state,
+                        RecordingState::ManualRecording { .. } | RecordingState::MotionRecording { .. });
 
                     if is_recording {
                         if ui.button("⏺ Stop Rec").clicked() {
@@ -355,15 +495,25 @@ impl eframe::App for CameraApp {
                         }
 
                         // Display recording status
-                        if let RecordingState::Recording { start_time, frame_count, total_bytes, .. } = &self.recording_state {
-                            let duration = start_time.elapsed().as_secs();
-                            let size_mb = *total_bytes as f32 / 1_000_000.0;
-                            ui.label(format!("🔴 {}:{:02} | {:.1}MB | {} frames",
-                                           duration / 60, duration % 60, size_mb, frame_count));
+                        match &self.recording_state {
+                            RecordingState::ManualRecording { start_time, frame_count, total_bytes, .. } => {
+                                let duration = start_time.elapsed().as_secs();
+                                let size_mb = *total_bytes as f32 / 1_000_000.0;
+                                ui.label(format!("🔴 MANUAL {}:{:02} | {:.1}MB | {} frames",
+                                               duration / 60, duration % 60, size_mb, frame_count));
+                            }
+                            RecordingState::MotionRecording { start_time, frame_count, total_bytes, motion_active, countdown_frames, .. } => {
+                                let duration = start_time.elapsed().as_secs();
+                                let size_mb = *total_bytes as f32 / 1_000_000.0;
+                                let motion_indicator = if *motion_active { "🔴 MOTION" } else { "⏱️  POST" };
+                                ui.label(format!("{} {}:{:02} | {:.1}MB | {} frames | {}f left",
+                                               motion_indicator, duration / 60, duration % 60, size_mb, frame_count, countdown_frames));
+                            }
+                            _ => {}
                         }
                     } else {
                         if ui.button("⏺ Start Rec").clicked() {
-                            if let Err(e) = self.start_recording() {
+                            if let Err(e) = self.start_manual_recording() {
                                 error!("Failed to start recording: {}", e);
                             }
                         }
@@ -440,10 +590,67 @@ impl eframe::App for CameraApp {
             }
 
             ui.separator();
+
+            // Phase 5: Motion Detection Settings
+            ui.heading("🔍 Motion Detection");
+            ui.separator();
+
+            ui.checkbox(&mut self.motion_config.enabled, "Enable Motion Detection");
+
+            if self.motion_config.enabled {
+                ui.add_space(5.0);
+
+                // Sensitivity slider
+                ui.label("Sensitivity:");
+                ui.add(egui::Slider::new(&mut self.motion_config.sensitivity, 0.0..=1.0)
+                    .text(""));
+                ui.label(format!("  {:.0}%", self.motion_config.sensitivity * 100.0));
+
+                ui.add_space(5.0);
+
+                // Minimum motion area
+                ui.label("Min Motion Area:");
+                ui.add(egui::Slider::new(&mut self.motion_config.min_motion_area, 0.1..=10.0)
+                    .text("%"));
+
+                ui.add_space(5.0);
+
+                // Pre-record seconds
+                ui.label("Pre-record (sec):");
+                ui.add(egui::Slider::new(&mut self.motion_config.pre_record_seconds, 5..=30)
+                    .text("s"));
+
+                ui.add_space(5.0);
+
+                // Post-record seconds
+                ui.label("Post-record (sec):");
+                ui.add(egui::Slider::new(&mut self.motion_config.post_record_seconds, 10..=60)
+                    .text("s"));
+
+                ui.add_space(5.0);
+
+                // Motion detector stats
+                let stats = self.motion_detector.stats();
+                if stats.total_frames > 0 {
+                    ui.label(format!("📊 Detection: {:.1}%", stats.detection_rate));
+                }
+
+                // Ring buffer status
+                ui.label(format!("💾 Buffer: {}/{} frames ({:.1}%)",
+                    self.ring_buffer.len(),
+                    self.ring_buffer.capacity(),
+                    self.ring_buffer.usage_ratio() * 100.0));
+
+                if let Some(age) = self.ring_buffer.oldest_frame_age_secs() {
+                    ui.label(format!("⏱️  Oldest: {:.1}s ago", age));
+                }
+            }
+
+            ui.separator();
             ui.label("💡 Tips:");
             ui.label("• Connect Spresense via USB");
             ui.label("• Click Start to begin");
-            ui.label("• Press Stop to pause");
+            ui.label("• Motion rec = auto start");
         });
 
         // Central panel - Video display

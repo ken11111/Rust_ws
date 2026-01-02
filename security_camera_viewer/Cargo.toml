@@ -36,6 +36,10 @@ egui_extras = { version = "0.27", optional = true, features = ["image"] }
 # Time handling for metrics
 chrono = "0.4"
 
+[dev-dependencies]
+# For testing
+tempfile = "3.8"
+
 [features]
 default = []
 async = ["tokio"]
