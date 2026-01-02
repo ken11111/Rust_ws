@@ -1,5 +1,6 @@
 mod protocol;
 mod serial;
+mod tcp_connection;  // Phase 7: WiFi support
 mod metrics;
 mod ring_buffer;
 mod motion_detector;
@@ -8,6 +9,7 @@ mod mp4_recorder;
 use eframe::egui;
 use log::{error, info, warn};
 use serial::SerialConnection;
+use tcp_connection::TcpConnection;  // Phase 7: WiFi support
 use protocol::Packet;
 use metrics::{MetricsLogger, PerformanceMetrics, SpresenseFpsCalculator, SpresenseCameraFpsCalculator};
 use ring_buffer::{RingBuffer, JpegFrame};
@@ -40,6 +42,21 @@ enum RecordingFormat {
 impl Default for RecordingFormat {
     fn default() -> Self {
         RecordingFormat::Mp4  // Phase 6以降はMP4をデフォルトに
+    }
+}
+
+// Phase 7: Transport type selection (USB Serial vs WiFi TCP)
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum TransportType {
+    /// USB Serial connection (Phase 1-6)
+    UsbSerial,
+    /// WiFi TCP connection (Phase 7)
+    WiFi,
+}
+
+impl Default for TransportType {
+    fn default() -> Self {
+        TransportType::UsbSerial  // USB Serial is default
     }
 }
 
@@ -137,6 +154,11 @@ struct CameraApp {
     // Settings
     port_path: String,
     auto_detect: bool,
+
+    // Phase 7: WiFi settings
+    transport_type: TransportType,
+    wifi_host: String,
+    wifi_port: u16,
 }
 
 impl CameraApp {
@@ -173,6 +195,10 @@ impl CameraApp {
             mp4_recorder: None,
             port_path: "/dev/ttyACM0".to_string(),
             auto_detect: true,
+            // Phase 7: WiFi settings
+            transport_type: TransportType::default(),
+            wifi_host: "192.168.1.100".to_string(),
+            wifi_port: 8888,
         }
     }
 
@@ -189,9 +215,13 @@ impl CameraApp {
         let is_recording = self.is_recording.clone();
         let port_path = self.port_path.clone();
         let auto_detect = self.auto_detect;
+        // Phase 7: WiFi configuration
+        let transport_type = self.transport_type;
+        let wifi_host = self.wifi_host.clone();
+        let wifi_port = self.wifi_port;
 
         thread::spawn(move || {
-            capture_thread(tx, is_running, is_recording, port_path, auto_detect);
+            capture_thread(tx, is_running, is_recording, port_path, auto_detect, transport_type, wifi_host, wifi_port);
         });
     }
 
@@ -672,11 +702,31 @@ impl eframe::App for CameraApp {
             ui.heading("⚙ Settings");
             ui.separator();
 
-            ui.checkbox(&mut self.auto_detect, "Auto-detect Spresense");
+            // Phase 7: Transport type selection
+            ui.label("Connection Type:");
+            ui.horizontal(|ui| {
+                ui.radio_value(&mut self.transport_type, TransportType::UsbSerial, "USB Serial");
+                ui.radio_value(&mut self.transport_type, TransportType::WiFi, "WiFi");
+            });
 
-            if !self.auto_detect {
-                ui.label("Serial Port:");
-                ui.text_edit_singleline(&mut self.port_path);
+            ui.add_space(5.0);
+
+            // USB Serial settings
+            if self.transport_type == TransportType::UsbSerial {
+                ui.checkbox(&mut self.auto_detect, "Auto-detect Spresense");
+                if !self.auto_detect {
+                    ui.label("Serial Port:");
+                    ui.text_edit_singleline(&mut self.port_path);
+                }
+            }
+            // WiFi settings
+            else if self.transport_type == TransportType::WiFi {
+                ui.label("Spresense IP Address:");
+                ui.text_edit_singleline(&mut self.wifi_host);
+
+                ui.add_space(3.0);
+                ui.label("Port:");
+                ui.add(egui::DragValue::new(&mut self.wifi_port).clamp_range(1..=65535));
             }
 
             ui.separator();
@@ -744,7 +794,12 @@ impl eframe::App for CameraApp {
 
             ui.separator();
             ui.label("💡 Tips:");
-            ui.label("• Connect Spresense via USB");
+            if self.transport_type == TransportType::UsbSerial {
+                ui.label("• Connect Spresense via USB");
+            } else {
+                ui.label("• Connect Spresense to WiFi");
+                ui.label("• Enter Spresense IP address");
+            }
             ui.label("• Click Start to begin");
             ui.label("• Motion rec = auto start");
         });
@@ -774,46 +829,134 @@ impl eframe::App for CameraApp {
     }
 }
 
+// Phase 7: Connection abstraction for Serial/TCP
+enum Connection {
+    Serial(SerialConnection),
+    Tcp(TcpConnection),
+}
+
+impl Connection {
+    fn read_packet(&mut self) -> io::Result<Packet> {
+        match self {
+            Connection::Serial(serial) => serial.read_packet(),
+            Connection::Tcp(tcp) => {
+                // Read raw packet from TCP
+                let mut buffer = vec![0u8; 150_000];
+                let size = tcp.read_packet(&mut buffer)?;
+                buffer.truncate(size);
+
+                // Parse packet based on sync word
+                if size < 4 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "Packet too small",
+                    ));
+                }
+
+                use byteorder::{ByteOrder, LittleEndian};
+                let sync_word = LittleEndian::read_u32(&buffer[0..4]);
+
+                match sync_word {
+                    protocol::SYNC_WORD => {
+                        // MJPEG packet
+                        let mjpeg_packet = protocol::MjpegPacket::parse(&buffer)?;
+                        Ok(Packet::Mjpeg(mjpeg_packet))
+                    }
+                    protocol::METRICS_SYNC_WORD => {
+                        // Metrics packet
+                        let metrics_packet = protocol::MetricsPacket::parse(&buffer)?;
+                        Ok(Packet::Metrics(metrics_packet))
+                    }
+                    _ => Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("Unknown sync word: 0x{:08X}", sync_word),
+                    )),
+                }
+            }
+        }
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        match self {
+            Connection::Serial(serial) => serial.flush(),
+            Connection::Tcp(_) => Ok(()), // TCP doesn't need flush
+        }
+    }
+
+    fn connection_info(&self) -> String {
+        match self {
+            Connection::Serial(_) => "USB Serial".to_string(),
+            Connection::Tcp(tcp) => tcp.connection_info(),
+        }
+    }
+}
+
 fn capture_thread(
     tx: Sender<AppMessage>,
     is_running: Arc<Mutex<bool>>,
     is_recording: Arc<AtomicBool>,
     port_path: String,
     auto_detect: bool,
+    transport_type: TransportType,  // Phase 7: WiFi support
+    wifi_host: String,
+    wifi_port: u16,
 ) {
-    info!("Capture thread started");
+    info!("Capture thread started (transport: {:?})", transport_type);
 
-    // Connect to serial port
-    let mut serial = if auto_detect {
-        tx.send(AppMessage::ConnectionStatus("Connecting (auto-detect)...".to_string())).ok();
-        match SerialConnection::auto_detect() {
-            Ok(s) => {
-                tx.send(AppMessage::ConnectionStatus("Connected".to_string())).ok();
-                s
-            }
-            Err(e) => {
-                error!("Failed to auto-detect: {}", e);
-                tx.send(AppMessage::ConnectionStatus(format!("Error: {}", e))).ok();
-                return;
-            }
+    // Phase 7: Connect based on transport type
+    let mut connection = match transport_type {
+        TransportType::UsbSerial => {
+            // USB Serial connection (Phase 1-6)
+            let serial = if auto_detect {
+                tx.send(AppMessage::ConnectionStatus("Connecting (auto-detect)...".to_string())).ok();
+                match SerialConnection::auto_detect() {
+                    Ok(s) => {
+                        tx.send(AppMessage::ConnectionStatus("Connected".to_string())).ok();
+                        s
+                    }
+                    Err(e) => {
+                        error!("Failed to auto-detect: {}", e);
+                        tx.send(AppMessage::ConnectionStatus(format!("Error: {}", e))).ok();
+                        return;
+                    }
+                }
+            } else {
+                tx.send(AppMessage::ConnectionStatus(format!("Connecting to {}...", port_path))).ok();
+                match SerialConnection::open(&port_path, 115200) {
+                    Ok(s) => {
+                        tx.send(AppMessage::ConnectionStatus("Connected".to_string())).ok();
+                        s
+                    }
+                    Err(e) => {
+                        error!("Failed to open port: {}", e);
+                        tx.send(AppMessage::ConnectionStatus(format!("Error: {}", e))).ok();
+                        return;
+                    }
+                }
+            };
+            Connection::Serial(serial)
         }
-    } else {
-        tx.send(AppMessage::ConnectionStatus(format!("Connecting to {}...", port_path))).ok();
-        match SerialConnection::open(&port_path, 115200) {
-            Ok(s) => {
-                tx.send(AppMessage::ConnectionStatus("Connected".to_string())).ok();
-                s
-            }
-            Err(e) => {
-                error!("Failed to open port: {}", e);
-                tx.send(AppMessage::ConnectionStatus(format!("Error: {}", e))).ok();
-                return;
+        TransportType::WiFi => {
+            // WiFi TCP connection (Phase 7)
+            tx.send(AppMessage::ConnectionStatus(format!("Connecting to {}:{}...", wifi_host, wifi_port))).ok();
+            match TcpConnection::new(&wifi_host, wifi_port) {
+                Ok(tcp) => {
+                    let info = tcp.connection_info();
+                    tx.send(AppMessage::ConnectionStatus(format!("Connected: {}", info))).ok();
+                    info!("TCP connected: {}", info);
+                    Connection::Tcp(tcp)
+                }
+                Err(e) => {
+                    error!("Failed to connect to TCP server: {}", e);
+                    tx.send(AppMessage::ConnectionStatus(format!("Error: {}", e))).ok();
+                    return;
+                }
             }
         }
     };
 
     // Flush buffer
-    if let Err(e) = serial.flush() {
+    if let Err(e) = connection.flush() {
         error!("Failed to flush: {}", e);
     }
 
@@ -871,9 +1014,9 @@ fn capture_thread(
     let mut spresense_errors = 0u32;
 
     while *is_running.lock().unwrap() {
-        // Measure serial read time
+        // Measure read time (serial or TCP)
         let read_start = Instant::now();
-        let read_result = serial.read_packet();
+        let read_result = connection.read_packet();
         let serial_read_time_ms = read_start.elapsed().as_secs_f32() * 1000.0;
 
         match read_result {
