@@ -3,6 +3,7 @@ mod serial;
 mod metrics;
 mod ring_buffer;
 mod motion_detector;
+mod mp4_recorder;
 
 use eframe::egui;
 use log::{error, info, warn};
@@ -11,6 +12,7 @@ use protocol::Packet;
 use metrics::{MetricsLogger, PerformanceMetrics, SpresenseFpsCalculator, SpresenseCameraFpsCalculator};
 use ring_buffer::{RingBuffer, JpegFrame};
 use motion_detector::{MotionDetector, MotionDetectionConfig};
+use mp4_recorder::Mp4Recorder;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -26,7 +28,21 @@ const MAX_RECORDING_SIZE: u64 = 1_000_000_000;  // 1 GB
 const RECORDING_DIR: &str = "./recordings";
 
 // Phase 3/5: Recording state management
-#[derive(Debug, Clone)]
+/// 録画フォーマット (Phase 6)
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum RecordingFormat {
+    /// MJPEG形式（Phase 3-5）
+    Mjpeg,
+    /// MP4形式（Phase 6）
+    Mp4,
+}
+
+impl Default for RecordingFormat {
+    fn default() -> Self {
+        RecordingFormat::Mp4  // Phase 6以降はMP4をデフォルトに
+    }
+}
+
 enum RecordingState {
     Idle,
     /// 手動録画 (Phase 3)
@@ -35,6 +51,7 @@ enum RecordingState {
         start_time: Instant,
         frame_count: u32,
         total_bytes: u64,
+        format: RecordingFormat,  // Phase 6: 録画フォーマット
     },
     /// 動き検知録画 (Phase 5)
     MotionRecording {
@@ -44,6 +61,7 @@ enum RecordingState {
         total_bytes: u64,
         motion_active: bool,           // 現在動き検知中か
         countdown_frames: u32,         // ポスト録画残りフレーム数
+        format: RecordingFormat,  // Phase 6: 録画フォーマット
     },
 }
 
@@ -112,6 +130,10 @@ struct CameraApp {
     ring_buffer: RingBuffer,
     last_motion_time: Option<Instant>,
 
+    // Phase 6: MP4 recording
+    recording_format: RecordingFormat,
+    mp4_recorder: Option<Mp4Recorder>,
+
     // Settings
     port_path: String,
     auto_detect: bool,
@@ -147,6 +169,8 @@ impl CameraApp {
             motion_detector: MotionDetector::default(),
             ring_buffer: RingBuffer::from_seconds(10, 11),  // 10秒@11fps
             last_motion_time: None,
+            recording_format: RecordingFormat::default(),
+            mp4_recorder: None,
             port_path: "/dev/ttyACM0".to_string(),
             auto_detect: true,
         }
@@ -194,14 +218,28 @@ impl CameraApp {
         // Create recording directory if it doesn't exist
         std::fs::create_dir_all(&self.recording_dir)?;
 
-        // Generate filename with timestamp
+        // Generate filename with timestamp (Phase 6: dynamic extension)
         let now = chrono::Local::now();
-        let filename = format!("manual_{}.mjpeg", now.format("%Y%m%d_%H%M%S"));
+        let extension = match self.recording_format {
+            RecordingFormat::Mjpeg => "mjpeg",
+            RecordingFormat::Mp4 => "mp4",
+        };
+        let filename = format!("manual_{}.{}", now.format("%Y%m%d_%H%M%S"), extension);
         let filepath = self.recording_dir.join(&filename);
 
-        // Create file
-        let file = File::create(&filepath)?;
-        info!("Started manual recording to: {:?}", filepath);
+        // Phase 6: Create recorder based on format
+        match self.recording_format {
+            RecordingFormat::Mjpeg => {
+                let file = File::create(&filepath)?;
+                info!("Started manual MJPEG recording to: {:?}", filepath);
+                self.recording_file = Some(Arc::new(Mutex::new(file)));
+            }
+            RecordingFormat::Mp4 => {
+                let recorder = Mp4Recorder::new(&filepath, 11)?;  // 11 fps
+                info!("Started manual MP4 recording to: {:?}", filepath);
+                self.mp4_recorder = Some(recorder);
+            }
+        }
 
         // Update state
         self.recording_state = RecordingState::ManualRecording {
@@ -209,9 +247,9 @@ impl CameraApp {
             start_time: Instant::now(),
             frame_count: 0,
             total_bytes: 0,
+            format: self.recording_format,
         };
 
-        self.recording_file = Some(Arc::new(Mutex::new(file)));
         self.is_recording.store(true, Ordering::Relaxed);
 
         Ok(())
@@ -227,19 +265,52 @@ impl CameraApp {
         // Create recording directory
         std::fs::create_dir_all(&self.recording_dir)?;
 
-        // Generate filename with timestamp
+        // Generate filename with timestamp (Phase 6: dynamic extension)
         let now = chrono::Local::now();
-        let filename = format!("motion_{}.mjpeg", now.format("%Y%m%d_%H%M%S"));
+        let extension = match self.recording_format {
+            RecordingFormat::Mjpeg => "mjpeg",
+            RecordingFormat::Mp4 => "mp4",
+        };
+        let filename = format!("motion_{}.{}", now.format("%Y%m%d_%H%M%S"), extension);
         let filepath = self.recording_dir.join(&filename);
 
-        // Create file
-        let mut file = File::create(&filepath)?;
+        // Phase 6: Create recorder and write pre-buffer based on format
+        let (pre_frames, pre_bytes) = match self.recording_format {
+            RecordingFormat::Mjpeg => {
+                let mut file = File::create(&filepath)?;
+                let (frames, bytes) = self.ring_buffer.flush_to_file(&mut file)?;
+                info!("Started motion MJPEG recording to: {:?}", filepath);
+                info!("  Pre-buffer: {} frames, {:.2} MB", frames, bytes as f32 / 1_000_000.0);
+                self.recording_file = Some(Arc::new(Mutex::new(file)));
+                (frames, bytes)
+            }
+            RecordingFormat::Mp4 => {
+                let mut recorder = Mp4Recorder::new(&filepath, 11)?;
 
-        // Write pre-buffer (10 seconds before motion)
-        let (pre_frames, pre_bytes) = self.ring_buffer.flush_to_file(&mut file)?;
+                // Write pre-buffer frames to MP4
+                let mut pre_frame_count = 0;
+                let mut pre_byte_count = 0;
 
-        info!("Started motion recording to: {:?}", filepath);
-        info!("  Pre-buffer: {} frames, {:.2} MB", pre_frames, pre_bytes as f32 / 1_000_000.0);
+                // Ring bufferから各フレームを取得してMP4に書き込む
+                // Note: ring_bufferはflush_to_fileでしか一括取得できないため、
+                // 一時的にMJPEGファイルを経由する必要がある
+                // TODO: より効率的な実装（ring_bufferにイテレータを追加）
+                let temp_file_path = std::env::temp_dir().join(format!("prebuffer_{}.mjpeg", now.format("%Y%m%d_%H%M%S")));
+                let mut temp_file = File::create(&temp_file_path)?;
+                let (frames, bytes) = self.ring_buffer.flush_to_file(&mut temp_file)?;
+                drop(temp_file);
+
+                // TODO: MJPEGファイルを読み込んで個別フレームとしてMP4に書き込む処理
+                // 現在の実装では、プリバッファはスキップ（MP4の場合）
+                warn!("MP4 motion recording: pre-buffer not yet implemented, starting from current frame");
+
+                std::fs::remove_file(temp_file_path)?;
+
+                info!("Started motion MP4 recording to: {:?}", filepath);
+                self.mp4_recorder = Some(recorder);
+                (0, 0)  // プリバッファは未実装
+            }
+        };
 
         // Update state
         self.recording_state = RecordingState::MotionRecording {
@@ -249,9 +320,9 @@ impl CameraApp {
             total_bytes: pre_bytes as u64,
             motion_active: true,
             countdown_frames: self.motion_config.post_record_seconds * 11,  // 11 fps
+            format: self.recording_format,
         };
 
-        self.recording_file = Some(Arc::new(Mutex::new(file)));
         self.is_recording.store(true, Ordering::Relaxed);
         self.last_motion_time = Some(Instant::now());
 
@@ -261,8 +332,8 @@ impl CameraApp {
     fn stop_recording(&mut self) -> io::Result<()> {
         // Check if recording (manual or motion)
         match &self.recording_state {
-            RecordingState::ManualRecording { filepath, start_time, frame_count, total_bytes } |
-            RecordingState::MotionRecording { filepath, start_time, frame_count, total_bytes, .. } => {
+            RecordingState::ManualRecording { filepath, start_time, frame_count, total_bytes, format } |
+            RecordingState::MotionRecording { filepath, start_time, frame_count, total_bytes, format, .. } => {
                 let duration = start_time.elapsed();
                 let is_motion = matches!(self.recording_state, RecordingState::MotionRecording { .. });
 
@@ -271,8 +342,17 @@ impl CameraApp {
                 info!("  Frames: {}", frame_count);
                 info!("  Size: {:.2} MB", *total_bytes as f32 / 1_000_000.0);
 
-                // Close file
-                self.recording_file = None;
+                // Phase 6: Close recorder based on format
+                match format {
+                    RecordingFormat::Mjpeg => {
+                        self.recording_file = None;
+                    }
+                    RecordingFormat::Mp4 => {
+                        if let Some(recorder) = self.mp4_recorder.take() {
+                            recorder.finish()?;
+                        }
+                    }
+                }
 
                 // Update state
                 self.recording_state = RecordingState::Idle;
@@ -289,8 +369,8 @@ impl CameraApp {
     fn write_frame(&mut self, jpeg_data: &[u8]) -> io::Result<()> {
         // Check if recording (manual or motion)
         match &mut self.recording_state {
-            RecordingState::ManualRecording { total_bytes, frame_count, .. } |
-            RecordingState::MotionRecording { total_bytes, frame_count, .. } => {
+            RecordingState::ManualRecording { total_bytes, frame_count, format, .. } |
+            RecordingState::MotionRecording { total_bytes, frame_count, format, .. } => {
                 // Check size limit
                 if *total_bytes + jpeg_data.len() as u64 > MAX_RECORDING_SIZE {
                     warn!("Recording size limit reached ({} MB), stopping", MAX_RECORDING_SIZE / 1_000_000);
@@ -298,17 +378,28 @@ impl CameraApp {
                     return Ok(());
                 }
 
-                // Write JPEG data to file
-                if let Some(ref file) = self.recording_file {
-                    let mut file_guard = file.lock().unwrap();
-                    file_guard.write_all(jpeg_data)?;
-                    // Note: flush() removed to reduce GUI thread blocking
-                    // File will be flushed automatically on close or periodically by OS
-
-                    // Update counters
-                    *total_bytes += jpeg_data.len() as u64;
-                    *frame_count += 1;
+                // Phase 6: Write to appropriate recorder based on format
+                match format {
+                    RecordingFormat::Mjpeg => {
+                        // Write JPEG data to MJPEG file
+                        if let Some(ref file) = self.recording_file {
+                            let mut file_guard = file.lock().unwrap();
+                            file_guard.write_all(jpeg_data)?;
+                            // Note: flush() removed to reduce GUI thread blocking
+                            // File will be flushed automatically on close or periodically by OS
+                        }
+                    }
+                    RecordingFormat::Mp4 => {
+                        // Write JPEG frame to MP4 encoder
+                        if let Some(ref mut recorder) = self.mp4_recorder {
+                            recorder.write_frame(jpeg_data)?;
+                        }
+                    }
                 }
+
+                // Update counters
+                *total_bytes += jpeg_data.len() as u64;
+                *frame_count += 1;
             }
             RecordingState::Idle => {
                 // Not recording, do nothing
@@ -512,6 +603,11 @@ impl eframe::App for CameraApp {
                             _ => {}
                         }
                     } else {
+                        // Phase 6: Recording format selector
+                        ui.label("Format:");
+                        ui.radio_value(&mut self.recording_format, RecordingFormat::Mp4, "MP4");
+                        ui.radio_value(&mut self.recording_format, RecordingFormat::Mjpeg, "MJPEG");
+
                         if ui.button("⏺ Start Rec").clicked() {
                             if let Err(e) = self.start_manual_recording() {
                                 error!("Failed to start recording: {}", e);
