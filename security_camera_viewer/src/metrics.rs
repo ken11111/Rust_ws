@@ -22,6 +22,9 @@ pub struct PerformanceMetrics {
     pub spresense_usb_packets: u32,    // Spresense USB packets sent
     pub action_q_depth: u32,           // Pipeline queue depth (0-3)
     pub spresense_errors: u32,         // Spresense error count
+    // Phase 7: TCP performance metrics
+    pub tcp_avg_send_ms: f32,          // Average TCP send time (milliseconds)
+    pub tcp_max_send_ms: f32,          // Maximum TCP send time (milliseconds)
 }
 
 impl PerformanceMetrics {
@@ -42,6 +45,9 @@ impl PerformanceMetrics {
             spresense_usb_packets: 0,
             action_q_depth: 0,
             spresense_errors: 0,
+            // Phase 7: TCP performance metrics
+            tcp_avg_send_ms: 0.0,
+            tcp_max_send_ms: 0.0,
         }
     }
 
@@ -82,7 +88,8 @@ impl MetricsLogger {
             file,
             "timestamp,pc_fps,spresense_fps,frame_count,error_count,\
              decode_time_ms,serial_read_time_ms,texture_upload_time_ms,jpeg_size_kb,\
-             spresense_camera_frames,spresense_camera_fps,spresense_usb_packets,action_q_depth,spresense_errors"
+             spresense_camera_frames,spresense_camera_fps,spresense_usb_packets,action_q_depth,spresense_errors,\
+             tcp_avg_send_ms,tcp_max_send_ms"
         )?;
 
         Ok(Self {
@@ -97,7 +104,7 @@ impl MetricsLogger {
 
         writeln!(
             file,
-            "{:.3},{:.2},{:.2},{},{},{:.2},{:.2},{:.2},{:.2},{},{:.2},{},{},{}",
+            "{:.3},{:.2},{:.2},{},{},{:.2},{:.2},{:.2},{:.2},{},{:.2},{},{},{},{:.2},{:.2}",
             metrics.timestamp,
             metrics.pc_fps,
             metrics.spresense_fps,
@@ -112,6 +119,8 @@ impl MetricsLogger {
             metrics.spresense_usb_packets,
             metrics.action_q_depth,
             metrics.spresense_errors,
+            metrics.tcp_avg_send_ms,
+            metrics.tcp_max_send_ms,
         )?;
 
         file.flush()?;

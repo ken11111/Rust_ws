@@ -77,7 +77,7 @@ impl TcpConnection {
 
         const MJPEG_SYNC_WORD: u32 = 0xCAFEBABE;
         const METRICS_SYNC_WORD: u32 = 0xCAFEBEEF;
-        const MAX_SYNC_ATTEMPTS: usize = 100000; // 最大100KBスキップ
+        const MAX_SYNC_ATTEMPTS: usize = 10000; // 最大10KBスキップ（100KBは遅すぎる）
 
         // Phase 1: Sync word検索 - 同期が取れるまで1バイトずつ読む
         let mut sync_buffer = [0u8; 4];

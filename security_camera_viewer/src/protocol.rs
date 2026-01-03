@@ -9,7 +9,7 @@ pub const MIN_PACKET_SIZE: usize = MJPEG_HEADER_SIZE + CRC_SIZE; // 14 bytes
 
 /// Metrics Protocol Constants (Phase 4.1 extension)
 pub const METRICS_SYNC_WORD: u32 = 0xCAFEBEEF;
-pub const METRICS_PACKET_SIZE: usize = 38; // Total size including CRC
+pub const METRICS_PACKET_SIZE: usize = 42; // Total size including CRC (Phase 7: +4 bytes for TCP stats)
 
 /// MJPEG Packet Header (12 bytes)
 #[derive(Debug, Clone)]
@@ -139,7 +139,7 @@ impl MjpegPacket {
     }
 }
 
-/// Metrics Packet (Phase 4.1 extension, 38 bytes total)
+/// Metrics Packet (Phase 4.1 extension, Phase 7 TCP stats added, 42 bytes total)
 #[derive(Debug, Clone)]
 pub struct MetricsPacket {
     pub sequence: u32,           // Metrics packet sequence number
@@ -149,6 +149,8 @@ pub struct MetricsPacket {
     pub action_q_depth: u32,     // Current action queue depth (0-3)
     pub avg_packet_size: u32,    // Average MJPEG packet size (bytes)
     pub errors: u32,             // Total error count
+    pub tcp_avg_send_us: u32,    // Average TCP send time (microseconds, Phase 7)
+    pub tcp_max_send_us: u32,    // Maximum TCP send time (microseconds, Phase 7)
 }
 
 impl MetricsPacket {
@@ -181,11 +183,12 @@ impl MetricsPacket {
         let action_q_depth = cursor.read_u32::<LittleEndian>()?;
         let avg_packet_size = cursor.read_u32::<LittleEndian>()?;
         let errors = cursor.read_u32::<LittleEndian>()?;
-        let _reserved = cursor.read_u32::<LittleEndian>()?; // Reserved field
+        let tcp_avg_send_us = cursor.read_u32::<LittleEndian>()?; // Phase 7: TCP stats
+        let tcp_max_send_us = cursor.read_u32::<LittleEndian>()?; // Phase 7: TCP stats
         let crc16 = cursor.read_u16::<LittleEndian>()?;
 
-        // Verify CRC (36 bytes: all fields except crc16 itself)
-        let calculated_crc = calculate_crc16_ccitt(&buf[0..36]);
+        // Verify CRC (40 bytes: all fields except crc16 itself)
+        let calculated_crc = calculate_crc16_ccitt(&buf[0..40]);
         if calculated_crc != crc16 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -202,6 +205,8 @@ impl MetricsPacket {
             action_q_depth,
             avg_packet_size,
             errors,
+            tcp_avg_send_us,
+            tcp_max_send_us,
         })
     }
 }

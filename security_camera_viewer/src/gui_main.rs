@@ -97,7 +97,7 @@ enum AppMessage {
         texture_upload_time_ms: f32,
         jpeg_size_kb: f32,  // JPEG size in KB
     },
-    SpresenseMetrics {  // Phase 4.1: Spresense-side metrics
+    SpresenseMetrics {  // Phase 4.1: Spresense-side metrics (Phase 7: TCP stats added)
         timestamp_ms: u32,
         camera_frames: u32,
         camera_fps: f32,
@@ -105,6 +105,8 @@ enum AppMessage {
         action_q_depth: u32,
         avg_packet_size: u32,
         errors: u32,
+        tcp_avg_send_us: u32,   // Phase 7: Average TCP send time (microseconds)
+        tcp_max_send_us: u32,   // Phase 7: Maximum TCP send time (microseconds)
     },
     JpegFrame(Vec<u8>),  // Phase 3: JPEG frame data for recording
 }
@@ -135,6 +137,10 @@ struct CameraApp {
     spresense_camera_fps: Option<f32>,
     spresense_action_q_depth: Option<u32>,
     spresense_errors: Option<u32>,
+
+    // Phase 7: TCP performance metrics
+    tcp_avg_send_ms: Option<f32>,
+    tcp_max_send_ms: Option<f32>,
 
     // Phase 3: Recording functionality
     recording_state: RecordingState,
@@ -184,6 +190,9 @@ impl CameraApp {
             spresense_camera_fps: None,
             spresense_action_q_depth: None,
             spresense_errors: None,
+
+            tcp_avg_send_ms: None,
+            tcp_max_send_ms: None,
             recording_state: RecordingState::Idle,
             recording_file: None,
             recording_dir: PathBuf::from(RECORDING_DIR),
@@ -540,12 +549,14 @@ impl CameraApp {
                     self.texture_upload_time_ms = texture_upload_time_ms;
                     self.jpeg_size_kb = jpeg_size_kb;
                 }
-                AppMessage::SpresenseMetrics { timestamp_ms: _, camera_frames, camera_fps, usb_packets: _, action_q_depth, avg_packet_size: _, errors } => {
-                    // Phase 4.1: Update Spresense-side metrics
+                AppMessage::SpresenseMetrics { timestamp_ms: _, camera_frames, camera_fps, usb_packets: _, action_q_depth, avg_packet_size: _, errors, tcp_avg_send_us, tcp_max_send_us } => {
+                    // Phase 4.1/7: Update Spresense-side metrics
                     self.spresense_camera_frames = Some(camera_frames);
                     self.spresense_camera_fps = Some(camera_fps);
                     self.spresense_action_q_depth = Some(action_q_depth);
                     self.spresense_errors = Some(errors);
+                    self.tcp_avg_send_ms = Some(tcp_avg_send_us as f32 / 1000.0);  // Convert μs to ms
+                    self.tcp_max_send_ms = Some(tcp_max_send_us as f32 / 1000.0);  // Convert μs to ms
                 }
                 AppMessage::JpegFrame(jpeg_data) => {
                     // Phase 5: Add to ring buffer (if motion detection enabled)
@@ -1138,6 +1149,9 @@ fn capture_thread(
                             spresense_usb_packets,
                             action_q_depth: spresense_action_q_depth,
                             spresense_errors,
+                            // Phase 7: TCP performance metrics
+                            tcp_avg_send_ms: self.tcp_avg_send_ms.unwrap_or(0.0),
+                            tcp_max_send_ms: self.tcp_max_send_ms.unwrap_or(0.0),
                         };
 
                         if let Err(e) = logger.log(&metrics) {
@@ -1179,6 +1193,8 @@ fn capture_thread(
                     action_q_depth: metrics.action_q_depth,
                     avg_packet_size: metrics.avg_packet_size,
                     errors: metrics.errors,
+                    tcp_avg_send_us: metrics.tcp_avg_send_us,
+                    tcp_max_send_us: metrics.tcp_max_send_us,
                 }).ok();
             }
             Err(e) => {

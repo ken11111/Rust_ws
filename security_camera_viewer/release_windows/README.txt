@@ -206,6 +206,8 @@ Phase 7 (2026-01-03):
   - GS2200M WiFi driver integration
   - Dual transport mode (USB/WiFi)
   - Mobile AP support
+  - TCP performance metrics (send time measurement)
+  - CSV logging with TCP statistics
 
 Phase 4.2 (2025-12-31):
   - GUI viewer implementation
