@@ -75,77 +75,159 @@ impl TcpConnection {
     pub fn read_packet(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
         let mut total_read = 0;
 
-        // Phase 1: ヘッダー読み込み (14 bytes)
-        // [SYNC_WORD:4][SEQUENCE:4][JPEG_SIZE:4][RESERVED:2]
-        while total_read < 14 {
-            match self.stream.read(&mut buffer[total_read..]) {
-                Ok(0) => {
-                    error!("Connection closed by Spresense");
-                    return Err(io::Error::new(
-                        io::ErrorKind::UnexpectedEof,
-                        "Connection closed by server",
-                    ));
+        const MJPEG_SYNC_WORD: u32 = 0xCAFEBABE;
+        const METRICS_SYNC_WORD: u32 = 0xCAFEBEEF;
+        const MAX_SYNC_ATTEMPTS: usize = 100000; // 最大100KBスキップ
+
+        // Phase 1: Sync word検索 - 同期が取れるまで1バイトずつ読む
+        let mut sync_buffer = [0u8; 4];
+        let mut sync_attempts = 0;
+
+        loop {
+            // 4バイト読み込み
+            if total_read == 0 {
+                // 最初の4バイト
+                for i in 0..4 {
+                    match self.stream.read(&mut sync_buffer[i..i+1]) {
+                        Ok(0) => {
+                            return Err(io::Error::new(
+                                io::ErrorKind::UnexpectedEof,
+                                "Connection closed by server",
+                            ));
+                        }
+                        Ok(_) => {}
+                        Err(e) => return Err(e),
+                    }
                 }
-                Ok(n) => {
-                    total_read += n;
+            } else {
+                // 1バイトスライドして新しい1バイトを読む
+                sync_buffer[0] = sync_buffer[1];
+                sync_buffer[1] = sync_buffer[2];
+                sync_buffer[2] = sync_buffer[3];
+                match self.stream.read(&mut sync_buffer[3..4]) {
+                    Ok(0) => {
+                        return Err(io::Error::new(
+                            io::ErrorKind::UnexpectedEof,
+                            "Connection closed while searching sync word",
+                        ));
+                    }
+                    Ok(_) => {}
+                    Err(e) => return Err(e),
                 }
-                Err(e) if e.kind() == io::ErrorKind::WouldBlock || e.kind() == io::ErrorKind::TimedOut => {
-                    warn!("Read timeout while reading header");
-                    return Err(e);
+            }
+
+            let sync_word = u32::from_le_bytes(sync_buffer);
+
+            // 正しいsync wordを発見
+            if sync_word == MJPEG_SYNC_WORD || sync_word == METRICS_SYNC_WORD {
+                // sync wordをバッファにコピー
+                buffer[0..4].copy_from_slice(&sync_buffer);
+                total_read = 4;
+
+                if sync_attempts > 0 {
+                    warn!("Sync word found after {} bytes skipped", sync_attempts);
                 }
-                Err(e) => {
-                    error!("Read error: {}", e);
-                    return Err(e);
-                }
+                break;
+            }
+
+            sync_attempts += 1;
+            if sync_attempts > MAX_SYNC_ATTEMPTS {
+                error!("Failed to find sync word after {} attempts", MAX_SYNC_ATTEMPTS);
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "Sync word not found",
+                ));
             }
         }
 
-        // Phase 2: JPEG sizeを抽出 (リトルエンディアン)
-        let jpeg_size = u32::from_le_bytes([
-            buffer[8],
-            buffer[9],
-            buffer[10],
-            buffer[11],
-        ]) as usize;
+        // Phase 2: Sync wordを判定
+        let sync_word = u32::from_le_bytes([buffer[0], buffer[1], buffer[2], buffer[3]]);
 
-        // サイズ妥当性チェック
-        if jpeg_size == 0 || jpeg_size > 150_000 {
-            error!("Invalid JPEG size: {} bytes", jpeg_size);
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("Invalid JPEG size: {}", jpeg_size),
-            ));
-        }
+        match sync_word {
+            MJPEG_SYNC_WORD => {
+                // MJPEGパケット: 残りのヘッダー + JPEG data + CRC
+                // ヘッダー残り10バイト読み込み
+                while total_read < 14 {
+                    match self.stream.read(&mut buffer[total_read..]) {
+                        Ok(0) => {
+                            return Err(io::Error::new(
+                                io::ErrorKind::UnexpectedEof,
+                                "Connection closed while reading MJPEG header",
+                            ));
+                        }
+                        Ok(n) => total_read += n,
+                        Err(e) => return Err(e),
+                    }
+                }
 
-        // Phase 3: JPEG data + CRC読み込み
-        let remaining = jpeg_size + 2; // JPEG + CRC16
-        let mut read_so_far = 0;
+                // JPEG sizeを抽出
+                let jpeg_size = u32::from_le_bytes([
+                    buffer[8],
+                    buffer[9],
+                    buffer[10],
+                    buffer[11],
+                ]) as usize;
 
-        while read_so_far < remaining {
-            match self.stream.read(&mut buffer[total_read..]) {
-                Ok(0) => {
-                    error!("Connection closed while reading JPEG data");
+                // サイズ妥当性チェック
+                if jpeg_size == 0 || jpeg_size > 150_000 {
+                    error!("Invalid JPEG size: {} bytes", jpeg_size);
                     return Err(io::Error::new(
-                        io::ErrorKind::UnexpectedEof,
-                        "Connection closed while reading JPEG",
+                        io::ErrorKind::InvalidData,
+                        format!("Invalid JPEG size: {}", jpeg_size),
                     ));
                 }
-                Ok(n) => {
-                    total_read += n;
-                    read_so_far += n;
+
+                // JPEG data + CRC読み込み
+                let remaining = jpeg_size + 2;
+                let mut read_so_far = 0;
+
+                while read_so_far < remaining {
+                    match self.stream.read(&mut buffer[total_read..]) {
+                        Ok(0) => {
+                            return Err(io::Error::new(
+                                io::ErrorKind::UnexpectedEof,
+                                "Connection closed while reading JPEG data",
+                            ));
+                        }
+                        Ok(n) => {
+                            total_read += n;
+                            read_so_far += n;
+                        }
+                        Err(e) => return Err(e),
+                    }
                 }
-                Err(e) if e.kind() == io::ErrorKind::WouldBlock || e.kind() == io::ErrorKind::TimedOut => {
-                    warn!("Read timeout while reading JPEG data");
-                    return Err(e);
+
+                Ok(total_read)
+            }
+
+            METRICS_SYNC_WORD => {
+                // Metricsパケット: 固定38バイト
+                const METRICS_PACKET_SIZE: usize = 38;
+
+                while total_read < METRICS_PACKET_SIZE {
+                    match self.stream.read(&mut buffer[total_read..]) {
+                        Ok(0) => {
+                            return Err(io::Error::new(
+                                io::ErrorKind::UnexpectedEof,
+                                "Connection closed while reading metrics packet",
+                            ));
+                        }
+                        Ok(n) => total_read += n,
+                        Err(e) => return Err(e),
+                    }
                 }
-                Err(e) => {
-                    error!("Read error while reading JPEG: {}", e);
-                    return Err(e);
-                }
+
+                Ok(total_read)
+            }
+
+            _ => {
+                error!("Unknown sync word: 0x{:08X}", sync_word);
+                Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("Unknown sync word: 0x{:08X}", sync_word),
+                ))
             }
         }
-
-        Ok(total_read)
     }
 
     /// 接続情報を取得
