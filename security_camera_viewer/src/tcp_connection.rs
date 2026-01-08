@@ -76,6 +76,7 @@ impl TcpConnection {
         let mut total_read = 0;
 
         const MJPEG_SYNC_WORD: u32 = 0xCAFEBABE;
+        const MJPEG_BATCH_SYNC_WORD: u32 = 0xCAFEBABF;  // Phase 7.2a: Multi-frame batching
         const METRICS_SYNC_WORD: u32 = 0xCAFEBEEF;
         const MAX_SYNC_ATTEMPTS: usize = 10000; // 最大10KBスキップ（100KBは遅すぎる）
 
@@ -119,7 +120,7 @@ impl TcpConnection {
             let sync_word = u32::from_le_bytes(sync_buffer);
 
             // 正しいsync wordを発見
-            if sync_word == MJPEG_SYNC_WORD || sync_word == METRICS_SYNC_WORD {
+            if sync_word == MJPEG_SYNC_WORD || sync_word == MJPEG_BATCH_SYNC_WORD || sync_word == METRICS_SYNC_WORD {
                 // sync wordをバッファにコピー
                 buffer[0..4].copy_from_slice(&sync_buffer);
                 total_read = 4;
@@ -197,6 +198,82 @@ impl TcpConnection {
                     }
                 }
 
+                Ok(total_read)
+            }
+
+            MJPEG_BATCH_SYNC_WORD => {
+                // Phase 7.2a: Batch packet (multiple frames in one packet)
+                // Batch header: sync(4) + batch_seq(4) + frame_count(4) + total_size(4) = 16 bytes
+
+                // ヘッダー残り12バイト読み込み
+                while total_read < 16 {
+                    match self.stream.read(&mut buffer[total_read..]) {
+                        Ok(0) => {
+                            return Err(io::Error::new(
+                                io::ErrorKind::UnexpectedEof,
+                                "Connection closed while reading batch header",
+                            ));
+                        }
+                        Ok(n) => total_read += n,
+                        Err(e) => return Err(e),
+                    }
+                }
+
+                // frame_countとtotal_sizeを抽出
+                let frame_count = u32::from_le_bytes([
+                    buffer[8],
+                    buffer[9],
+                    buffer[10],
+                    buffer[11],
+                ]) as usize;
+
+                let total_size = u32::from_le_bytes([
+                    buffer[12],
+                    buffer[13],
+                    buffer[14],
+                    buffer[15],
+                ]) as usize;
+
+                // 妥当性チェック
+                if frame_count == 0 || frame_count > 3 {
+                    error!("Invalid batch frame count: {}", frame_count);
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("Invalid batch frame count: {}", frame_count),
+                    ));
+                }
+
+                if total_size == 0 || total_size > 200_000 {
+                    error!("Invalid batch total size: {} bytes", total_size);
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("Invalid batch total size: {}", total_size),
+                    ));
+                }
+
+                // 各フレームのメタデータ + JPEG data + CRC読み込み
+                // 残りのデータ = frame_count * (meta 8 bytes + JPEG data) + CRC 2 bytes
+                // = frame_count * 8 + total_size + 2
+                let remaining = frame_count * 8 + total_size + 2;
+                let mut read_so_far = 0;
+
+                while read_so_far < remaining {
+                    match self.stream.read(&mut buffer[total_read..]) {
+                        Ok(0) => {
+                            return Err(io::Error::new(
+                                io::ErrorKind::UnexpectedEof,
+                                "Connection closed while reading batch data",
+                            ));
+                        }
+                        Ok(n) => {
+                            total_read += n;
+                            read_so_far += n;
+                        }
+                        Err(e) => return Err(e),
+                    }
+                }
+
+                info!("Batch packet received: {} frames, {} bytes total", frame_count, total_read);
                 Ok(total_read)
             }
 

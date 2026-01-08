@@ -226,6 +226,61 @@ fn main() -> Result<()> {
                        metrics.errors);
             }
 
+            Ok(Packet::Batch(batch)) => {
+                // Phase 7.2a: Process batch packet (multiple frames)
+                error_count = 0;
+                packet_count += 1;
+
+                debug!("Batch packet #{}: batch_seq={}, frames={}, total_size={} bytes",
+                       packet_count,
+                       batch.header.batch_sequence,
+                       batch.header.frame_count,
+                       batch.header.total_size);
+
+                // Process each frame in the batch
+                for (i, frame) in batch.frames.iter().enumerate() {
+                    frame_count += 1;
+
+                    debug!("  Frame {}/{}: seq={}, size={} bytes",
+                           i + 1,
+                           batch.header.frame_count,
+                           frame.metadata.frame_sequence,
+                           frame.metadata.frame_size);
+
+                    // Verify JPEG validity
+                    let has_soi = frame.jpeg_data.len() >= 2 &&
+                                  frame.jpeg_data[0] == 0xFF &&
+                                  frame.jpeg_data[1] == 0xD8;
+                    let has_eoi = frame.jpeg_data.len() >= 2 &&
+                                  frame.jpeg_data[frame.jpeg_data.len() - 2] == 0xFF &&
+                                  frame.jpeg_data[frame.jpeg_data.len() - 1] == 0xD9;
+
+                    if !has_soi || !has_eoi {
+                        warn!("Frame #{}: Invalid JPEG markers!", frame_count);
+                    }
+
+                    // Write JPEG file if individual_files is enabled
+                    if args.individual_files {
+                        let output_dir = PathBuf::from(&args.output);
+                        let filename = format!("frame_{:06}.jpg", frame_count);
+                        let filepath = output_dir.join(&filename);
+
+                        match std::fs::write(&filepath, &frame.jpeg_data) {
+                            Ok(_) => debug!("Saved: {}", filename),
+                            Err(e) => error!("Failed to save {}: {}", filename, e),
+                        }
+                    }
+                }
+
+                // Update statistics
+                total_bytes += batch.total_size() as u64;
+
+                if packet_count % 10 == 0 {
+                    info!("Progress: {} batches, {} frames, {} bytes total",
+                          packet_count, frame_count, total_bytes);
+                }
+            }
+
             Err(e) => {
                 error_count += 1;
 
