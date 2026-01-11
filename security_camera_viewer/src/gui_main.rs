@@ -1024,6 +1024,10 @@ fn capture_thread(
     let mut spresense_action_q_depth = 0u32;
     let mut spresense_errors = 0u32;
 
+    // Phase 7: TCP performance metrics (from Metrics packets)
+    let mut tcp_avg_send_ms = 0.0f32;
+    let mut tcp_max_send_ms = 0.0f32;
+
     while *is_running.lock().unwrap() {
         // Measure read time (serial or TCP)
         let read_start = Instant::now();
@@ -1150,8 +1154,8 @@ fn capture_thread(
                             action_q_depth: spresense_action_q_depth,
                             spresense_errors,
                             // Phase 7: TCP performance metrics
-                            tcp_avg_send_ms: self.tcp_avg_send_ms.unwrap_or(0.0),
-                            tcp_max_send_ms: self.tcp_max_send_ms.unwrap_or(0.0),
+                            tcp_avg_send_ms,
+                            tcp_max_send_ms,
                         };
 
                         if let Err(e) = logger.log(&metrics) {
@@ -1181,6 +1185,10 @@ fn capture_thread(
                 spresense_action_q_depth = metrics.action_q_depth;
                 spresense_errors = metrics.errors;
 
+                // Phase 7: Update TCP performance metrics
+                tcp_avg_send_ms = metrics.tcp_avg_send_us as f32 / 1000.0;  // Convert μs to ms
+                tcp_max_send_ms = metrics.tcp_max_send_us as f32 / 1000.0;  // Convert μs to ms
+
                 info!("Received Spresense metrics: frames={}, fps={:.1}, usb_pkts={}, q_depth={}, errors={}",
                       metrics.camera_frames, camera_fps, metrics.usb_packets,
                       metrics.action_q_depth, metrics.errors);
@@ -1196,6 +1204,127 @@ fn capture_thread(
                     tcp_avg_send_us: metrics.tcp_avg_send_us,
                     tcp_max_send_us: metrics.tcp_max_send_us,
                 }).ok();
+            }
+            Ok(Packet::Batch(batch)) => {
+                // Phase 7.2a: Batch packet - process multiple frames
+                packet_error_count = 0;
+
+                info!("Batch packet: batch_seq={}, frames={}, total_size={} bytes",
+                      batch.header.batch_sequence,
+                      batch.header.frame_count,
+                      batch.header.total_size);
+
+                // Process each frame in the batch
+                for frame in batch.frames.iter() {
+                    frame_count += 1;
+                    frames_since_last_stats += 1;
+
+                    // Update Spresense FPS from frame sequence number
+                    let current_spresense_fps = spresense_fps_calc.update(frame.metadata.frame_sequence);
+
+                    // Accumulate JPEG size
+                    let jpeg_size_bytes = frame.jpeg_data.len();
+                    total_jpeg_size_bytes += jpeg_size_bytes as u64;
+
+                    // Phase 3: Send JPEG data for recording ONLY when recording is active
+                    if is_recording.load(Ordering::Relaxed) {
+                        tx.send(AppMessage::JpegFrame(frame.jpeg_data.clone())).ok();
+                    }
+
+                    // Decode JPEG in capture thread
+                    let decode_start = Instant::now();
+                    match image::load_from_memory(&frame.jpeg_data) {
+                        Ok(img) => {
+                            consecutive_jpeg_errors = 0;
+
+                            let decode_time_ms = decode_start.elapsed().as_secs_f32() * 1000.0;
+                            total_decode_time_ms += decode_time_ms;
+
+                            // Convert to RGBA8
+                            let rgba = img.to_rgba8();
+                            let width = img.width();
+                            let height = img.height();
+                            let pixels = rgba.into_raw();
+
+                            // Send pre-decoded frame to GUI
+                            tx.send(AppMessage::DecodedFrame {
+                                width,
+                                height,
+                                pixels,
+                            }).ok();
+                        }
+                        Err(e) => {
+                            error!("Failed to decode JPEG from batch: {}", e);
+                            jpeg_decode_error_count += 1;
+                            consecutive_jpeg_errors += 1;
+
+                            if consecutive_jpeg_errors == 5 {
+                                warn!("5 consecutive JPEG decode errors detected");
+                            } else if consecutive_jpeg_errors >= 10 {
+                                error!("10+ consecutive JPEG decode errors - check Spresense");
+                            }
+                        }
+                    }
+                }
+
+                // Update statistics every second
+                let now = Instant::now();
+                let elapsed = now.duration_since(last_stats_time).as_secs_f32();
+                if elapsed >= 1.0 {
+                    let fps = frames_since_last_stats as f32 / elapsed;
+
+                    avg_decode_time_ms = total_decode_time_ms / frames_since_last_stats as f32;
+                    avg_serial_read_time_ms = total_serial_read_time_ms / frames_since_last_stats as f32;
+                    avg_jpeg_size_kb = (total_jpeg_size_bytes as f32 / frames_since_last_stats as f32) / 1024.0;
+                    avg_spresense_fps = spresense_fps_calc.current_fps();
+
+                    tx.send(AppMessage::Stats {
+                        fps,
+                        spresense_fps: avg_spresense_fps,
+                        frame_count,
+                        errors: jpeg_decode_error_count,
+                        decode_time_ms: avg_decode_time_ms,
+                        serial_read_time_ms: avg_serial_read_time_ms,
+                        texture_upload_time_ms: 0.0,
+                        jpeg_size_kb: avg_jpeg_size_kb,
+                    }).ok();
+
+                    // Log metrics to CSV
+                    if let Some(ref logger) = metrics_logger {
+                        let metrics = PerformanceMetrics {
+                            timestamp: std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .unwrap()
+                                .as_secs_f64(),
+                            pc_fps: fps,
+                            spresense_fps: avg_spresense_fps,
+                            frame_count,
+                            error_count: jpeg_decode_error_count,
+                            decode_time_ms: avg_decode_time_ms,
+                            serial_read_time_ms: avg_serial_read_time_ms,
+                            texture_upload_time_ms: 0.0,
+                            jpeg_size_kb: avg_jpeg_size_kb,
+                            spresense_camera_frames,
+                            spresense_camera_fps,
+                            spresense_usb_packets,
+                            action_q_depth: spresense_action_q_depth,
+                            spresense_errors,
+                            tcp_avg_send_ms,
+                            tcp_max_send_ms,
+                        };
+
+                        if let Err(e) = logger.log(&metrics) {
+                            error!("Failed to log metrics: {}", e);
+                        }
+                    }
+
+                    // Reset accumulators
+                    frames_since_last_stats = 0;
+                    total_decode_time_ms = 0.0;
+                    total_serial_read_time_ms = 0.0;
+                    total_jpeg_size_bytes = 0;
+                    last_stats_time = now;
+                }
             }
             Err(e) => {
                 if e.kind() != std::io::ErrorKind::TimedOut {
