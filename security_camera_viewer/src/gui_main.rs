@@ -60,6 +60,39 @@ impl Default for TransportType {
     }
 }
 
+// Phase 7.3.3: Error handling mode for continuous operation
+/// エラーハンドリングモード
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum ErrorHandlingMode {
+    /// 本番モード: エラーがあっても処理継続（連続運転優先）
+    Production,
+    /// デバッグモード: 重大なエラーで停止（問題早期発見）
+    Debug,
+}
+
+impl Default for ErrorHandlingMode {
+    fn default() -> Self {
+        ErrorHandlingMode::Production  // Default to production for continuous operation
+    }
+}
+
+impl ErrorHandlingMode {
+    fn is_production(&self) -> bool {
+        matches!(self, ErrorHandlingMode::Production)
+    }
+
+    fn is_debug(&self) -> bool {
+        matches!(self, ErrorHandlingMode::Debug)
+    }
+
+    fn as_str(&self) -> &str {
+        match self {
+            ErrorHandlingMode::Production => "Production (連続運転)",
+            ErrorHandlingMode::Debug => "Debug (エラーで停止)",
+        }
+    }
+}
+
 enum RecordingState {
     Idle,
     /// 手動録画 (Phase 3)
@@ -165,6 +198,9 @@ struct CameraApp {
     transport_type: TransportType,
     wifi_host: String,
     wifi_port: u16,
+
+    // Phase 7.3.3: Error handling mode
+    error_handling_mode: ErrorHandlingMode,
 }
 
 impl CameraApp {
@@ -208,6 +244,8 @@ impl CameraApp {
             transport_type: TransportType::default(),
             wifi_host: "192.168.1.100".to_string(),
             wifi_port: 8888,
+            // Phase 7.3.3: Error handling mode
+            error_handling_mode: ErrorHandlingMode::default(),
         }
     }
 
@@ -228,9 +266,11 @@ impl CameraApp {
         let transport_type = self.transport_type;
         let wifi_host = self.wifi_host.clone();
         let wifi_port = self.wifi_port;
+        // Phase 7.3.3: Error handling mode
+        let error_handling_mode = self.error_handling_mode;
 
         thread::spawn(move || {
-            capture_thread(tx, is_running, is_recording, port_path, auto_detect, transport_type, wifi_host, wifi_port);
+            capture_thread(tx, is_running, is_recording, port_path, auto_detect, transport_type, wifi_host, wifi_port, error_handling_mode);
         });
     }
 
@@ -722,6 +762,16 @@ impl eframe::App for CameraApp {
 
             ui.add_space(5.0);
 
+            // Phase 7.3.3: Error handling mode
+            ui.label("Error Handling:");
+            ui.horizontal(|ui| {
+                ui.radio_value(&mut self.error_handling_mode, ErrorHandlingMode::Production, "🟢 Production");
+                ui.radio_value(&mut self.error_handling_mode, ErrorHandlingMode::Debug, "🔴 Debug");
+            });
+            ui.label(format!("  {}", self.error_handling_mode.as_str()));
+
+            ui.add_space(5.0);
+
             // USB Serial settings
             if self.transport_type == TransportType::UsbSerial {
                 ui.checkbox(&mut self.auto_detect, "Auto-detect Spresense");
@@ -851,8 +901,8 @@ impl Connection {
         match self {
             Connection::Serial(serial) => serial.read_packet(),
             Connection::Tcp(tcp) => {
-                // Read raw packet from TCP
-                let mut buffer = vec![0u8; 150_000];
+                // Read raw packet from TCP (Phase 7.2c: Increased to 250KB for safety margin)
+                let mut buffer = vec![0u8; 250_000];
                 let size = tcp.read_packet(&mut buffer)?;
                 buffer.truncate(size);
 
@@ -877,6 +927,11 @@ impl Connection {
                         // Metrics packet
                         let metrics_packet = protocol::MetricsPacket::parse(&buffer)?;
                         Ok(Packet::Metrics(metrics_packet))
+                    }
+                    protocol::MJPEG_BATCH_SYNC_WORD => {
+                        // Batch packet (Phase 7.2a: Multi-frame batching)
+                        let batch_packet = protocol::BatchPacket::parse(&buffer)?;
+                        Ok(Packet::Batch(batch_packet))
                     }
                     _ => Err(io::Error::new(
                         io::ErrorKind::InvalidData,
@@ -911,8 +966,9 @@ fn capture_thread(
     transport_type: TransportType,  // Phase 7: WiFi support
     wifi_host: String,
     wifi_port: u16,
+    error_handling_mode: ErrorHandlingMode,  // Phase 7.3.3: Error handling mode
 ) {
-    info!("Capture thread started (transport: {:?})", transport_type);
+    info!("Capture thread started (transport: {:?}, error_handling: {:?})", transport_type, error_handling_mode);
 
     // Phase 7: Connect based on transport type
     let mut connection = match transport_type {
@@ -1327,22 +1383,45 @@ fn capture_thread(
                 }
             }
             Err(e) => {
-                if e.kind() != std::io::ErrorKind::TimedOut {
-                    // Phase 4.1.1: Track packet read errors separately
-                    packet_error_count += 1;
-                    error!("Packet read error: {}", e);
-
-                    if packet_error_count >= 10 {
-                        error!("Too many consecutive packet errors ({}), stopping capture thread", packet_error_count);
-                        tx.send(AppMessage::ConnectionStatus("Too many packet errors".to_string())).ok();
+                // Phase 7.3.3: Distinguish between connection errors and packet errors
+                match e.kind() {
+                    // Connection errors: Always stop (both Production and Debug mode)
+                    std::io::ErrorKind::UnexpectedEof |
+                    std::io::ErrorKind::ConnectionReset |
+                    std::io::ErrorKind::ConnectionAborted |
+                    std::io::ErrorKind::BrokenPipe |
+                    std::io::ErrorKind::NotConnected => {
+                        error!("Connection closed: {} (error kind: {:?})", e, e.kind());
+                        tx.send(AppMessage::ConnectionStatus(format!("Connection closed: {}", e))).ok();
                         break;
                     }
 
-                    // Brief pause before retry to allow device to recover
-                    std::thread::sleep(std::time::Duration::from_millis(10));
-                } else {
-                    // Timeout is not counted as an error (device may be slow)
-                    // Continue to next iteration
+                    // Timeout: Not an error (device may be slow)
+                    std::io::ErrorKind::TimedOut => {
+                        // Continue to next iteration
+                    }
+
+                    // Packet/data errors: Mode-dependent behavior
+                    _ => {
+                        packet_error_count += 1;
+                        error!("Packet read error: {} (error kind: {:?})", e, e.kind());
+
+                        if packet_error_count >= 10 {
+                            if error_handling_mode.is_debug() {
+                                // Debug mode: Stop on critical errors
+                                error!("Too many consecutive packet errors ({}), stopping capture thread (Debug mode)", packet_error_count);
+                                tx.send(AppMessage::ConnectionStatus("Too many packet errors".to_string())).ok();
+                                break;
+                            } else {
+                                // Production mode: Log and continue
+                                warn!("Too many consecutive packet errors ({}), continuing (Production mode)", packet_error_count);
+                                // Don't break - continue operation for continuous running
+                            }
+                        }
+
+                        // Brief pause before retry to allow device to recover
+                        std::thread::sleep(std::time::Duration::from_millis(10));
+                    }
                 }
             }
         }

@@ -2,8 +2,8 @@
   Spresense Security Camera Viewer - Windows Release
 ================================================================================
 
-Version: Phase 7 (WiFi/TCP Support)
-Build Date: 2026-01-03
+Version: Phase 7.3.3 (Error Handling Mode)
+Build Date: 2026-01-13
 Platform: Windows x64
 
 ================================================================================
@@ -35,6 +35,35 @@ USB/Serial connection:
 
 TCP/WiFi connection:
   security_camera_viewer.exe --transport tcp --tcp-host 192.168.137.50 --tcp-port 8888
+
+================================================================================
+  Error Handling Mode (Phase 7.3.3 NEW!)
+================================================================================
+
+The GUI now includes two error handling modes for different use cases:
+
+Production Mode (🟢 Default):
+  - Continues operation even when errors occur
+  - Ideal for continuous 24/7 operation
+  - Logs errors but doesn't stop capture
+  - Recommended for production deployments
+
+Debug Mode (🔴):
+  - Stops capture after 10 consecutive packet errors
+  - Ideal for development and troubleshooting
+  - Helps identify problems early
+  - Recommended for debugging
+
+How to switch:
+1. Open GUI Settings panel (left side)
+2. Look for "Error Handling:" section
+3. Select "🟢 Production" or "🔴 Debug"
+4. Restart capture for changes to take effect
+
+Benefits:
+  - Production Mode: Prevents Spresense from stopping when PC has issues
+  - Enables long-term continuous operation
+  - Improves product reliability
 
 ================================================================================
   WiFi/TCP Setup
@@ -107,6 +136,38 @@ Solution:
   - Check WiFi signal strength
   - Verify WiFi credentials on Spresense
   - Increase timeout in settings
+
+Problem: "TCP connection drops immediately (Error -107 on Spresense)"
+Solution:
+  1. Run debug_tcp.bat to see detailed logs
+  2. Check for error messages in the console window
+  3. Verify buffer size is sufficient (Phase 7.2a: 200KB)
+  4. Ensure you're using the latest build (check timestamp)
+
+================================================================================
+  Debug Mode (Advanced)
+================================================================================
+
+To enable detailed logging for troubleshooting:
+
+Method 1: Use debug_tcp.bat
+  - Double-click "debug_tcp.bat"
+  - This will show detailed connection logs
+  - Useful for diagnosing TCP connection issues
+
+Method 2: Manual command line
+  - Open Command Prompt
+  - Run: set RUST_LOG=debug
+  - Run: security_camera_gui.exe
+  - Check console output for error messages
+
+Method 3: CLI with verbose logging
+  - Run: set RUST_LOG=debug
+  - Run: security_camera_viewer.exe --transport tcp --tcp-host 192.168.x.x -v
+
+Log file location:
+  - Console output only (no log file by default)
+  - To save logs: security_camera_gui.exe > log.txt 2>&1
 
 ================================================================================
   Performance Tips
@@ -200,6 +261,23 @@ https://claude.com/claude-code
 ================================================================================
   Version History
 ================================================================================
+
+Phase 7.3.3 (2026-01-13):
+  - Error handling mode (Production/Debug)
+  - Continuous operation support (24/7 running)
+  - GUI toggle switch for error handling mode
+  - Prevents PC errors from stopping Spresense
+  - Enhanced reliability for production deployments
+
+Phase 7.3.2 (2026-01-12):
+  - Accurate packet boundary handling
+  - CRC 2-byte fix in TCP protocol
+  - Buffer state management improvements
+
+Phase 7.3 (2026-01-12):
+  - Stateful TCP reading (150KB initial buffer)
+  - One-time sync search optimization
+  - 64KB incremental buffer refill
 
 Phase 7 (2026-01-03):
   - WiFi/TCP transport support
