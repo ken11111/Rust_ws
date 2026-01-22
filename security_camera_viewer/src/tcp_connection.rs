@@ -1,14 +1,29 @@
-/// TCP接続モジュール (Phase 7)
+/// TCP接続モジュール (Phase 7 + Phase 9 Auto-reconnect)
 ///
 /// SpresenseのTCPサーバーに接続し、MJPEGパケットを受信する。
 /// SerialConnection互換のインターフェースを提供。
+/// Phase 9: 自動再接続機能を追加。
 
 use std::io::{self, Read, Write};
 use std::net::{TcpStream, ToSocketAddrs, SocketAddr};
 use std::time::Duration;
+use std::thread;
 use log::{info, warn, error};
 
-/// TCP接続管理（Phase 7.3: ステートフル読み取り対応）
+/// Phase 9.1: 再接続設定（バックオフ付き）
+const RECONNECT_MAX_ATTEMPTS: u32 = 10;
+const RECONNECT_BASE_WAIT_SECS: u64 = 5;    // 基本待機時間
+const RECONNECT_BACKOFF_SECS: u64 = 2;      // 試行ごとの追加待機時間
+
+/// Phase 9: 接続状態
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum ConnectionState {
+    Connected,
+    Disconnected,
+    Reconnecting,
+}
+
+/// TCP接続管理（Phase 7.3: ステートフル読み取り対応 + Phase 9: 自動再接続）
 pub struct TcpConnection {
     stream: TcpStream,
     host: String,
@@ -18,6 +33,9 @@ pub struct TcpConnection {
     sync_established: bool,     // 初回sync完了フラグ
     internal_buffer: Vec<u8>,   // 内部バッファ（TCP read()のタイミング吸収用）
     buffer_pos: usize,          // 内部バッファの現在位置
+    // Phase 9: 自動再接続用フィールド
+    state: ConnectionState,     // 接続状態
+    reconnect_count: u32,       // 再接続回数（累積）
 }
 
 impl TcpConnection {
@@ -65,6 +83,9 @@ impl TcpConnection {
             sync_established: false,
             internal_buffer: Vec::with_capacity(256_000),  // 250KB内部バッファ
             buffer_pos: 0,
+            // Phase 9: 自動再接続初期化
+            state: ConnectionState::Connected,
+            reconnect_count: 0,
         })
     }
 
@@ -128,7 +149,8 @@ impl TcpConnection {
                     ));
                 }
 
-                14 + jpeg_size + 2  // Phase 7.3.2: CRC 2バイト復元（Spresense側で送信している）
+                // Header 12 bytes (sync 4 + seq 4 + size 4) + JPEG data + CRC 2 bytes
+                12 + jpeg_size + 2
             }
 
             MJPEG_BATCH_SYNC_WORD => {
@@ -172,18 +194,28 @@ impl TcpConnection {
             }
 
             METRICS_SYNC_WORD => {
-                // Metricsパケット: 固定38バイト
-                38
+                // Metricsパケット: 固定58バイト (Phase 9.2: +8 bytes for health metrics)
+                // 4*14 fields + 2 CRC = 58 bytes
+                58
             }
 
             _ => {
-                error!("Unknown sync word: 0x{:08X}", sync_word);
-                // 同期ずれの可能性があるため、次回は再度sync検索
-                self.sync_established = false;
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("Unknown sync word: 0x{:08X}", sync_word),
-                ));
+                // 同期ずれの可能性 - バッファ内で次のsync wordを検索
+                warn!("Unknown sync word: 0x{:08X}, searching for resync...", sync_word);
+
+                // バッファ内で次の有効なsync wordを探す
+                let resync_result = self.resync_in_buffer()?;
+                if !resync_result {
+                    // バッファ内に見つからない - ストリームから再検索
+                    self.sync_established = false;
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("Unknown sync word: 0x{:08X}", sync_word),
+                    ));
+                }
+
+                // 再帰的に再試行（バッファ位置が更新されている）
+                return self.read_packet(buffer);
             }
         };
 
@@ -360,6 +392,55 @@ impl TcpConnection {
         Ok(())
     }
 
+    /// バッファ内で次の有効なsync wordを検索 (Phase 8: 同期復帰改善)
+    ///
+    /// unknown sync wordが検出された場合、バッファ内で次の有効なsync wordを探す。
+    /// 見つかった場合はbuffer_posを更新してtrue、見つからない場合はfalseを返す。
+    fn resync_in_buffer(&mut self) -> io::Result<bool> {
+        const MJPEG_SYNC_WORD: u32 = 0xCAFEBABE;
+        const MJPEG_BATCH_SYNC_WORD: u32 = 0xCAFEBABF;
+        const METRICS_SYNC_WORD: u32 = 0xCAFEBEEF;
+        const MAX_SEARCH_BYTES: usize = 200_000;  // 最大200KB検索
+
+        let available = self.internal_buffer.len() - self.buffer_pos;
+
+        // 最低4バイト必要
+        if available < 4 {
+            return Ok(false);
+        }
+
+        let search_limit = std::cmp::min(available - 3, MAX_SEARCH_BYTES);
+        let mut found_offset = None;
+
+        // 1バイトずつスライドしながら検索
+        for offset in 1..search_limit {
+            let pos = self.buffer_pos + offset;
+            let sync_word = u32::from_le_bytes([
+                self.internal_buffer[pos],
+                self.internal_buffer[pos + 1],
+                self.internal_buffer[pos + 2],
+                self.internal_buffer[pos + 3],
+            ]);
+
+            if sync_word == MJPEG_SYNC_WORD
+                || sync_word == MJPEG_BATCH_SYNC_WORD
+                || sync_word == METRICS_SYNC_WORD
+            {
+                found_offset = Some(offset);
+                break;
+            }
+        }
+
+        if let Some(offset) = found_offset {
+            warn!("Resync found valid sync word at offset {} bytes", offset);
+            self.buffer_pos += offset;
+            Ok(true)
+        } else {
+            warn!("No valid sync word found in {} bytes", search_limit);
+            Ok(false)
+        }
+    }
+
     /// 接続情報を取得
     pub fn connection_info(&self) -> String {
         format!("TCP {}:{} ({})", self.host, self.port, self.peer_addr)
@@ -384,6 +465,151 @@ impl TcpConnection {
     pub fn is_connected(&self) -> bool {
         // TCP接続の状態確認 (簡易)
         self.stream.peer_addr().is_ok()
+    }
+
+    /// Phase 9: 接続状態を取得
+    pub fn connection_state(&self) -> ConnectionState {
+        self.state
+    }
+
+    /// Phase 9: 再接続回数を取得
+    pub fn reconnect_count(&self) -> u32 {
+        self.reconnect_count
+    }
+
+    /// Phase 9: 再接続を試行
+    ///
+    /// TCP切断を検出した場合に呼び出す。
+    /// 最大RECONNECT_MAX_ATTEMPTS回まで再接続を試行する。
+    ///
+    /// # Returns
+    /// 成功時はOk(()), 失敗時（上限到達等）はエラー
+    pub fn reconnect(&mut self) -> io::Result<()> {
+        for attempt in 1..=RECONNECT_MAX_ATTEMPTS {
+            self.state = ConnectionState::Reconnecting;
+
+            // Phase 9.1: バックオフ付き待機
+            // wait_secs = base + (attempt - 1) * backoff
+            let wait_secs = RECONNECT_BASE_WAIT_SECS +
+                            (attempt as u64 - 1) * RECONNECT_BACKOFF_SECS;
+
+            warn!("TCP disconnected, waiting {} secs before reconnect ({}/{})",
+                  wait_secs, attempt, RECONNECT_MAX_ATTEMPTS);
+
+            // 待機（GS2200Mのリソース解放を待つ）
+            thread::sleep(Duration::from_secs(wait_secs));
+
+            // 接続試行
+            let addr = format!("{}:{}", self.host, self.port);
+            let socket_addr = match addr.to_socket_addrs() {
+                Ok(mut addrs) => match addrs.next() {
+                    Some(addr) => addr,
+                    None => {
+                        error!("Reconnect attempt {} failed: Invalid address", attempt);
+                        continue;
+                    }
+                },
+                Err(e) => {
+                    error!("Reconnect attempt {} failed: {}", attempt, e);
+                    continue;
+                }
+            };
+
+            match TcpStream::connect_timeout(&socket_addr, Duration::from_secs(10)) {
+                Ok(stream) => {
+                    // 設定適用
+                    if let Err(e) = stream.set_read_timeout(Some(Duration::from_secs(30))) {
+                        warn!("Failed to set read timeout: {}", e);
+                    }
+                    if let Err(e) = stream.set_write_timeout(Some(Duration::from_secs(30))) {
+                        warn!("Failed to set write timeout: {}", e);
+                    }
+                    if let Err(e) = stream.set_nodelay(true) {
+                        warn!("Failed to set nodelay: {}", e);
+                    }
+
+                    // peer_addrを取得
+                    let peer_addr = match stream.peer_addr() {
+                        Ok(addr) => addr,
+                        Err(e) => {
+                            error!("Failed to get peer address: {}", e);
+                            continue;
+                        }
+                    };
+
+                    // 接続更新
+                    self.stream = stream;
+                    self.peer_addr = peer_addr;
+
+                    // sync状態リセット（再同期が必要）
+                    self.sync_established = false;
+                    self.internal_buffer.clear();
+                    self.buffer_pos = 0;
+
+                    // 状態更新
+                    self.state = ConnectionState::Connected;
+                    self.reconnect_count += 1;
+
+                    info!("Reconnected to Spresense: {} (attempt {})", self.peer_addr, attempt);
+                    return Ok(());
+                }
+                Err(e) => {
+                    error!("Reconnect attempt {} failed: {}", attempt, e);
+                }
+            }
+        }
+
+        self.state = ConnectionState::Disconnected;
+        Err(io::Error::new(
+            io::ErrorKind::ConnectionRefused,
+            format!("Failed to reconnect after {} attempts", RECONNECT_MAX_ATTEMPTS)
+        ))
+    }
+
+    /// Phase 9: 自動再接続対応パケット読み込み
+    ///
+    /// 切断検出時に自動で再接続を試行し、成功したら読み込みを継続する。
+    ///
+    /// # Arguments
+    /// * `buffer` - 読み込みバッファ (最小150KB推奨)
+    ///
+    /// # Returns
+    /// 成功時は読み込んだバイト数、失敗時はエラー
+    pub fn read_packet_with_reconnect(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        loop {
+            match self.read_packet(buffer) {
+                Ok(n) => return Ok(n),
+                Err(e) => {
+                    // 切断検出
+                    let is_disconnect = matches!(e.kind(),
+                        io::ErrorKind::UnexpectedEof |
+                        io::ErrorKind::ConnectionReset |
+                        io::ErrorKind::ConnectionAborted |
+                        io::ErrorKind::BrokenPipe
+                    );
+
+                    if is_disconnect {
+                        warn!("TCP disconnect detected: {}", e);
+
+                        // 再接続試行
+                        match self.reconnect() {
+                            Ok(()) => {
+                                info!("Reconnect successful, resuming read");
+                                // 再接続成功 → ループ継続（再度read_packet）
+                                continue;
+                            }
+                            Err(reconnect_err) => {
+                                error!("Reconnect failed: {}", reconnect_err);
+                                return Err(reconnect_err);
+                            }
+                        }
+                    }
+
+                    // その他のエラーはそのまま返す
+                    return Err(e);
+                }
+            }
+        }
     }
 }
 

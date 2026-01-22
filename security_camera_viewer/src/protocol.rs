@@ -9,7 +9,7 @@ pub const MIN_PACKET_SIZE: usize = MJPEG_HEADER_SIZE + CRC_SIZE; // 14 bytes
 
 /// Metrics Protocol Constants (Phase 4.1 extension)
 pub const METRICS_SYNC_WORD: u32 = 0xCAFEBEEF;
-pub const METRICS_PACKET_SIZE: usize = 42; // Total size including CRC (Phase 7: +4 bytes for TCP stats)
+pub const METRICS_PACKET_SIZE: usize = 58; // Total size including CRC (Phase 9.2: +8 bytes for health metrics)
 
 /// Batch Protocol Constants (Phase 7.2a: Multi-frame batching)
 pub const MJPEG_BATCH_SYNC_WORD: u32 = 0xCAFEBABF;
@@ -144,18 +144,22 @@ impl MjpegPacket {
     }
 }
 
-/// Metrics Packet (Phase 4.1 extension, Phase 7 TCP stats added, 42 bytes total)
+/// Metrics Packet (Phase 4.1 extension, Phase 7 TCP stats, Phase 7.3.3 drop stats, Phase 9.2 health, 58 bytes)
 #[derive(Debug, Clone)]
 pub struct MetricsPacket {
-    pub sequence: u32,           // Metrics packet sequence number
-    pub timestamp_ms: u32,       // Spresense uptime in milliseconds
-    pub camera_frames: u32,      // Total camera frames captured
-    pub usb_packets: u32,        // Total USB packets sent
-    pub action_q_depth: u32,     // Current action queue depth (0-3)
-    pub avg_packet_size: u32,    // Average MJPEG packet size (bytes)
-    pub errors: u32,             // Total error count
-    pub tcp_avg_send_us: u32,    // Average TCP send time (microseconds, Phase 7)
-    pub tcp_max_send_us: u32,    // Maximum TCP send time (microseconds, Phase 7)
+    pub sequence: u32,                  // Metrics packet sequence number
+    pub timestamp_ms: u32,              // Spresense uptime in milliseconds
+    pub camera_frames: u32,             // Total camera frames captured
+    pub usb_packets: u32,               // Total USB packets sent
+    pub action_q_depth: u32,            // Current action queue depth (0-3)
+    pub avg_packet_size: u32,           // Average MJPEG packet size (bytes)
+    pub errors: u32,                    // Total error count
+    pub tcp_avg_send_us: u32,           // Average TCP send time (microseconds, Phase 7)
+    pub tcp_max_send_us: u32,           // Maximum TCP send time (microseconds, Phase 7)
+    pub dropped_frames: u32,            // Total dropped frames (Phase 7.3.3)
+    pub drop_events: u32,               // Number of drop events (Phase 7.3.3)
+    pub tcp_health_moving_avg_ms: u32,  // TCP health moving average send time (Phase 9.2)
+    pub tcp_health_total_spikes: u32,   // TCP health total spike count (Phase 9.2)
 }
 
 impl MetricsPacket {
@@ -188,12 +192,16 @@ impl MetricsPacket {
         let action_q_depth = cursor.read_u32::<LittleEndian>()?;
         let avg_packet_size = cursor.read_u32::<LittleEndian>()?;
         let errors = cursor.read_u32::<LittleEndian>()?;
-        let tcp_avg_send_us = cursor.read_u32::<LittleEndian>()?; // Phase 7: TCP stats
-        let tcp_max_send_us = cursor.read_u32::<LittleEndian>()?; // Phase 7: TCP stats
+        let tcp_avg_send_us = cursor.read_u32::<LittleEndian>()?;         // Phase 7: TCP stats
+        let tcp_max_send_us = cursor.read_u32::<LittleEndian>()?;         // Phase 7: TCP stats
+        let dropped_frames = cursor.read_u32::<LittleEndian>()?;          // Phase 7.3.3: Frame drop stats
+        let drop_events = cursor.read_u32::<LittleEndian>()?;             // Phase 7.3.3: Frame drop stats
+        let tcp_health_moving_avg_ms = cursor.read_u32::<LittleEndian>()?; // Phase 9.2: Health metrics
+        let tcp_health_total_spikes = cursor.read_u32::<LittleEndian>()?;  // Phase 9.2: Health metrics
         let crc16 = cursor.read_u16::<LittleEndian>()?;
 
-        // Verify CRC (40 bytes: all fields except crc16 itself)
-        let calculated_crc = calculate_crc16_ccitt(&buf[0..40]);
+        // Verify CRC (56 bytes: all fields except crc16 itself)
+        let calculated_crc = calculate_crc16_ccitt(&buf[0..56]);
         if calculated_crc != crc16 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -212,6 +220,10 @@ impl MetricsPacket {
             errors,
             tcp_avg_send_us,
             tcp_max_send_us,
+            dropped_frames,
+            drop_events,
+            tcp_health_moving_avg_ms,
+            tcp_health_total_spikes,
         })
     }
 }
