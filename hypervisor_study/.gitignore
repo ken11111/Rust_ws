@@ -1,0 +1,16 @@
+# Exclude MiniVisor subproject (managed separately)
+MiniVisor/
+
+# Exclude temporary files
+*.tmp
+*.swp
+*.swo
+
+# Exclude build artifacts
+target/
+*.exe
+*.bin
+
+# Exclude personal notes that shouldn't be shared
+**/personal_notes/
+**/private_notes/

@@ -22,6 +22,15 @@ pub struct PerformanceMetrics {
     pub spresense_usb_packets: u32,    // Spresense USB packets sent
     pub action_q_depth: u32,           // Pipeline queue depth (0-3)
     pub spresense_errors: u32,         // Spresense error count
+    // Phase 7: TCP performance metrics
+    pub tcp_avg_send_ms: f32,          // Average TCP send time (milliseconds)
+    pub tcp_max_send_ms: f32,          // Maximum TCP send time (milliseconds)
+    // Phase 7.3.3: Frame drop statistics
+    pub dropped_frames: u32,           // Total dropped frames
+    pub drop_events: u32,              // Number of drop events
+    // Phase 9.2: TCP health metrics
+    pub tcp_health_moving_avg_ms: u32, // TCP health moving average send time (ms)
+    pub tcp_health_total_spikes: u32,  // TCP health total spike count
 }
 
 impl PerformanceMetrics {
@@ -42,6 +51,15 @@ impl PerformanceMetrics {
             spresense_usb_packets: 0,
             action_q_depth: 0,
             spresense_errors: 0,
+            // Phase 7: TCP performance metrics
+            tcp_avg_send_ms: 0.0,
+            tcp_max_send_ms: 0.0,
+            // Phase 7.3.3: Frame drop statistics
+            dropped_frames: 0,
+            drop_events: 0,
+            // Phase 9.2: TCP health metrics
+            tcp_health_moving_avg_ms: 0,
+            tcp_health_total_spikes: 0,
         }
     }
 
@@ -77,12 +95,14 @@ impl MetricsLogger {
 
         let mut file = File::create(&log_path)?;
 
-        // Write CSV header (Phase 4.1: Added Spresense-side metrics)
+        // Write CSV header (Phase 4.1, Phase 7.3.3, Phase 9.2)
         writeln!(
             file,
             "timestamp,pc_fps,spresense_fps,frame_count,error_count,\
              decode_time_ms,serial_read_time_ms,texture_upload_time_ms,jpeg_size_kb,\
-             spresense_camera_frames,spresense_camera_fps,spresense_usb_packets,action_q_depth,spresense_errors"
+             spresense_camera_frames,spresense_camera_fps,spresense_usb_packets,action_q_depth,spresense_errors,\
+             tcp_avg_send_ms,tcp_max_send_ms,dropped_frames,drop_events,\
+             tcp_health_moving_avg_ms,tcp_health_total_spikes"
         )?;
 
         Ok(Self {
@@ -91,13 +111,13 @@ impl MetricsLogger {
         })
     }
 
-    /// Log a metrics sample to CSV (Phase 4.1: Added Spresense-side metrics)
+    /// Log a metrics sample to CSV (Phase 4.1, Phase 7.3.3, Phase 9.2)
     pub fn log(&self, metrics: &PerformanceMetrics) -> io::Result<()> {
         let mut file = self.file.lock().unwrap();
 
         writeln!(
             file,
-            "{:.3},{:.2},{:.2},{},{},{:.2},{:.2},{:.2},{:.2},{},{:.2},{},{},{}",
+            "{:.3},{:.2},{:.2},{},{},{:.2},{:.2},{:.2},{:.2},{},{:.2},{},{},{},{:.2},{:.2},{},{},{},{}",
             metrics.timestamp,
             metrics.pc_fps,
             metrics.spresense_fps,
@@ -112,6 +132,12 @@ impl MetricsLogger {
             metrics.spresense_usb_packets,
             metrics.action_q_depth,
             metrics.spresense_errors,
+            metrics.tcp_avg_send_ms,
+            metrics.tcp_max_send_ms,
+            metrics.dropped_frames,
+            metrics.drop_events,
+            metrics.tcp_health_moving_avg_ms,
+            metrics.tcp_health_total_spikes,
         )?;
 
         file.flush()?;

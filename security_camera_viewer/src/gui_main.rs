@@ -1,18 +1,22 @@
 mod protocol;
 mod serial;
+mod tcp_connection;  // Phase 7: WiFi support
 mod metrics;
 mod ring_buffer;
 mod motion_detector;
 mod mp4_recorder;
+mod pipeline;  // Phase 8: 3-thread pipeline optimization
 
 use eframe::egui;
 use log::{error, info, warn};
 use serial::SerialConnection;
+use tcp_connection::TcpConnection;  // Phase 7: WiFi support
 use protocol::Packet;
 use metrics::{MetricsLogger, PerformanceMetrics, SpresenseFpsCalculator, SpresenseCameraFpsCalculator};
 use ring_buffer::{RingBuffer, JpegFrame};
 use motion_detector::{MotionDetector, MotionDetectionConfig};
 use mp4_recorder::Mp4Recorder;
+use pipeline::{Pipeline, PipelineMessage, Connection as PipelineConnection};  // Phase 8: Pipeline
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -40,6 +44,54 @@ enum RecordingFormat {
 impl Default for RecordingFormat {
     fn default() -> Self {
         RecordingFormat::Mp4  // Phase 6以降はMP4をデフォルトに
+    }
+}
+
+// Phase 7: Transport type selection (USB Serial vs WiFi TCP)
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum TransportType {
+    /// USB Serial connection (Phase 1-6)
+    UsbSerial,
+    /// WiFi TCP connection (Phase 7)
+    WiFi,
+}
+
+impl Default for TransportType {
+    fn default() -> Self {
+        TransportType::UsbSerial  // USB Serial is default
+    }
+}
+
+// Phase 7.3.3: Error handling mode for continuous operation
+/// エラーハンドリングモード
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum ErrorHandlingMode {
+    /// 本番モード: エラーがあっても処理継続（連続運転優先）
+    Production,
+    /// デバッグモード: 重大なエラーで停止（問題早期発見）
+    Debug,
+}
+
+impl Default for ErrorHandlingMode {
+    fn default() -> Self {
+        ErrorHandlingMode::Production  // Default to production for continuous operation
+    }
+}
+
+impl ErrorHandlingMode {
+    fn is_production(&self) -> bool {
+        matches!(self, ErrorHandlingMode::Production)
+    }
+
+    fn is_debug(&self) -> bool {
+        matches!(self, ErrorHandlingMode::Debug)
+    }
+
+    fn as_str(&self) -> &str {
+        match self {
+            ErrorHandlingMode::Production => "Production (連続運転)",
+            ErrorHandlingMode::Debug => "Debug (エラーで停止)",
+        }
     }
 }
 
@@ -80,7 +132,7 @@ enum AppMessage {
         texture_upload_time_ms: f32,
         jpeg_size_kb: f32,  // JPEG size in KB
     },
-    SpresenseMetrics {  // Phase 4.1: Spresense-side metrics
+    SpresenseMetrics {  // Phase 4.1 + 7 + 7.3.3 + 9.2
         timestamp_ms: u32,
         camera_frames: u32,
         camera_fps: f32,
@@ -88,14 +140,23 @@ enum AppMessage {
         action_q_depth: u32,
         avg_packet_size: u32,
         errors: u32,
+        tcp_avg_send_us: u32,           // Phase 7: Average TCP send time (microseconds)
+        tcp_max_send_us: u32,           // Phase 7: Maximum TCP send time (microseconds)
+        dropped_frames: u32,            // Phase 7.3.3: Total dropped frames
+        drop_events: u32,               // Phase 7.3.3: Number of drop events
+        tcp_health_moving_avg_ms: u32,  // Phase 9.2: TCP health moving average (ms)
+        tcp_health_total_spikes: u32,   // Phase 9.2: TCP health total spikes
     },
     JpegFrame(Vec<u8>),  // Phase 3: JPEG frame data for recording
 }
 
 struct CameraApp {
-    // Communication
+    // Communication (legacy - kept for compatibility)
     rx: Receiver<AppMessage>,
     tx: Sender<AppMessage>,
+
+    // Phase 8: Pipeline-based communication
+    pipeline: Option<Pipeline>,
 
     // State
     current_frame: Option<egui::TextureHandle>,
@@ -119,6 +180,18 @@ struct CameraApp {
     spresense_action_q_depth: Option<u32>,
     spresense_errors: Option<u32>,
 
+    // Phase 7: TCP performance metrics
+    tcp_avg_send_ms: Option<f32>,
+    tcp_max_send_ms: Option<f32>,
+
+    // Phase 7.3.3: Frame drop statistics
+    dropped_frames: Option<u32>,
+    drop_events: Option<u32>,
+
+    // Phase 9.2: TCP health metrics
+    tcp_health_moving_avg_ms: Option<u32>,
+    tcp_health_total_spikes: Option<u32>,
+
     // Phase 3: Recording functionality
     recording_state: RecordingState,
     recording_file: Option<Arc<Mutex<File>>>,
@@ -137,6 +210,17 @@ struct CameraApp {
     // Settings
     port_path: String,
     auto_detect: bool,
+
+    // Phase 7: WiFi settings
+    transport_type: TransportType,
+    wifi_host: String,
+    wifi_port: u16,
+
+    // Phase 7.3.3: Error handling mode
+    error_handling_mode: ErrorHandlingMode,
+
+    // Phase 8: MetricsLogger for CSV output
+    metrics_logger: Option<MetricsLogger>,
 }
 
 impl CameraApp {
@@ -146,6 +230,7 @@ impl CameraApp {
         Self {
             rx,
             tx,
+            pipeline: None,  // Phase 8: Pipeline initialized on start
             current_frame: None,
             connection_status: "Not connected".to_string(),
             is_running: Arc::new(Mutex::new(false)),
@@ -162,6 +247,13 @@ impl CameraApp {
             spresense_camera_fps: None,
             spresense_action_q_depth: None,
             spresense_errors: None,
+
+            tcp_avg_send_ms: None,
+            tcp_max_send_ms: None,
+            dropped_frames: None,
+            drop_events: None,
+            tcp_health_moving_avg_ms: None,   // Phase 9.2
+            tcp_health_total_spikes: None,    // Phase 9.2
             recording_state: RecordingState::Idle,
             recording_file: None,
             recording_dir: PathBuf::from(RECORDING_DIR),
@@ -173,6 +265,14 @@ impl CameraApp {
             mp4_recorder: None,
             port_path: "/dev/ttyACM0".to_string(),
             auto_detect: true,
+            // Phase 7: WiFi settings
+            transport_type: TransportType::default(),
+            wifi_host: "192.168.1.100".to_string(),
+            wifi_port: 8888,
+            // Phase 7.3.3: Error handling mode
+            error_handling_mode: ErrorHandlingMode::default(),
+            // Phase 8: MetricsLogger (initialized on start_capture)
+            metrics_logger: None,
         }
     }
 
@@ -183,21 +283,91 @@ impl CameraApp {
         }
 
         *self.is_running.lock().unwrap() = true;
+        self.connection_status = "Connecting...".to_string();
 
-        let tx = self.tx.clone();
-        let is_running = self.is_running.clone();
-        let is_recording = self.is_recording.clone();
-        let port_path = self.port_path.clone();
-        let auto_detect = self.auto_detect;
+        // Phase 8: Create connection and start pipeline
+        let connection = match self.transport_type {
+            TransportType::UsbSerial => {
+                // USB Serial connection
+                let serial = if self.auto_detect {
+                    match SerialConnection::auto_detect() {
+                        Ok(s) => s,
+                        Err(e) => {
+                            error!("Failed to auto-detect: {}", e);
+                            self.connection_status = format!("Error: {}", e);
+                            *self.is_running.lock().unwrap() = false;
+                            return;
+                        }
+                    }
+                } else {
+                    match SerialConnection::open(&self.port_path, 115200) {
+                        Ok(s) => s,
+                        Err(e) => {
+                            error!("Failed to open port: {}", e);
+                            self.connection_status = format!("Error: {}", e);
+                            *self.is_running.lock().unwrap() = false;
+                            return;
+                        }
+                    }
+                };
+                PipelineConnection::Serial(serial)
+            }
+            TransportType::WiFi => {
+                // WiFi TCP connection
+                match TcpConnection::new(&self.wifi_host, self.wifi_port) {
+                    Ok(tcp) => {
+                        info!("TCP connected: {}", tcp.connection_info());
+                        PipelineConnection::Tcp(tcp)
+                    }
+                    Err(e) => {
+                        error!("Failed to connect to TCP server: {}", e);
+                        self.connection_status = format!("Error: {}", e);
+                        *self.is_running.lock().unwrap() = false;
+                        return;
+                    }
+                }
+            }
+        };
 
-        thread::spawn(move || {
-            capture_thread(tx, is_running, is_recording, port_path, auto_detect);
-        });
+        // Phase 8: Start pipeline
+        let pipeline = Pipeline::new(connection, self.is_recording.clone());
+        self.pipeline = Some(pipeline);
+        self.connection_status = "Connected (Pipeline)".to_string();
+        info!("Phase 8 Pipeline started");
+
+        // Phase 8: Initialize MetricsLogger for CSV output
+        let current_dir = std::env::current_dir()
+            .unwrap_or_else(|_| PathBuf::from("."));
+        let metrics_dir = current_dir.join("metrics");
+
+        info!("📂 Current directory: {:?}", current_dir);
+        info!("📂 Metrics directory: {:?}", metrics_dir);
+
+        match MetricsLogger::new(metrics_dir.to_str().unwrap_or("metrics")) {
+            Ok(logger) => {
+                let full_path = logger.path().canonicalize().unwrap_or_else(|_| logger.path().clone());
+                info!("📊 Metrics logging ENABLED: {:?}", full_path);
+                self.connection_status = format!("Connected - Logging to: {:?}", full_path);
+                self.metrics_logger = Some(logger);
+            }
+            Err(e) => {
+                error!("❌ Failed to create metrics logger: {}", e);
+                error!("   Attempted path: {:?}", metrics_dir);
+                // Continue without metrics logging
+                self.metrics_logger = None;
+            }
+        }
     }
 
     fn stop_capture(&mut self) {
         *self.is_running.lock().unwrap() = false;
         self.connection_status = "Stopped".to_string();
+
+        // Phase 8: Stop pipeline
+        if let Some(ref mut pipeline) = self.pipeline {
+            pipeline.stop();
+        }
+        self.pipeline = None;
 
         // Phase 3/5: Auto-stop recording when capture stops
         if matches!(self.recording_state, RecordingState::ManualRecording { .. } | RecordingState::MotionRecording { .. }) {
@@ -205,6 +375,12 @@ impl CameraApp {
                 error!("Failed to auto-stop recording: {}", e);
             }
         }
+
+        // Phase 8: Close MetricsLogger
+        if let Some(ref logger) = self.metrics_logger {
+            info!("📊 Metrics saved to: {:?}", logger.path());
+        }
+        self.metrics_logger = None;
     }
 
     // Phase 3/5: Recording methods
@@ -292,23 +468,19 @@ impl CameraApp {
                 let mut pre_byte_count = 0;
 
                 // Ring bufferから各フレームを取得してMP4に書き込む
-                // Note: ring_bufferはflush_to_fileでしか一括取得できないため、
-                // 一時的にMJPEGファイルを経由する必要がある
-                // TODO: より効率的な実装（ring_bufferにイテレータを追加）
-                let temp_file_path = std::env::temp_dir().join(format!("prebuffer_{}.mjpeg", now.format("%Y%m%d_%H%M%S")));
-                let mut temp_file = File::create(&temp_file_path)?;
-                let (frames, bytes) = self.ring_buffer.flush_to_file(&mut temp_file)?;
-                drop(temp_file);
-
-                // TODO: MJPEGファイルを読み込んで個別フレームとしてMP4に書き込む処理
-                // 現在の実装では、プリバッファはスキップ（MP4の場合）
-                warn!("MP4 motion recording: pre-buffer not yet implemented, starting from current frame");
-
-                std::fs::remove_file(temp_file_path)?;
+                for frame in self.ring_buffer.iter_frames() {
+                    if let Err(e) = recorder.write_frame(&frame.jpeg_data) {
+                        warn!("Failed to write pre-buffer frame to MP4: {}", e);
+                        break;
+                    }
+                    pre_frame_count += 1;
+                    pre_byte_count += frame.jpeg_data.len();
+                }
 
                 info!("Started motion MP4 recording to: {:?}", filepath);
+                info!("  Pre-buffer: {} frames, {:.2} MB", pre_frame_count, pre_byte_count as f32 / 1_000_000.0);
                 self.mp4_recorder = Some(recorder);
-                (0, 0)  // プリバッファは未実装
+                (pre_frame_count, pre_byte_count)
             }
         };
 
@@ -410,7 +582,175 @@ impl CameraApp {
     }
 
     fn process_messages(&mut self, ctx: &egui::Context) {
-        // Process all pending messages
+        // Phase 8: Collect messages from pipeline first to avoid borrow conflicts
+        let pipeline_messages: Vec<PipelineMessage> = if let Some(ref pipeline) = self.pipeline {
+            let mut messages = Vec::new();
+            while let Some(msg) = pipeline.try_recv() {
+                messages.push(msg);
+            }
+            messages
+        } else {
+            Vec::new()
+        };
+
+        // Debug: Log message count periodically
+        static mut MSG_COUNT: u64 = 0;
+        unsafe {
+            MSG_COUNT += pipeline_messages.len() as u64;
+            if MSG_COUNT % 100 == 0 && MSG_COUNT > 0 {
+                info!("📬 Total pipeline messages processed: {}", MSG_COUNT);
+            }
+        }
+
+        // Process collected messages (pipeline reference is now dropped)
+        for msg in pipeline_messages {
+            match msg {
+                PipelineMessage::Frame(frame) => {
+                    // Phase 8: Receive pre-decoded RGBA data from pipeline
+                    let size = [frame.width as usize, frame.height as usize];
+                    let color_image = egui::ColorImage::from_rgba_unmultiplied(
+                        size,
+                        &frame.pixels,
+                    );
+
+                    if let Some(texture) = &mut self.current_frame {
+                        texture.set(color_image, egui::TextureOptions::LINEAR);
+                    } else {
+                        self.current_frame = Some(ctx.load_texture(
+                            "camera_frame",
+                            color_image,
+                            egui::TextureOptions::LINEAR,
+                        ));
+                    }
+
+                    // Update decode time stats from pipeline
+                    self.decode_time_ms = frame.decode_time_ms;
+                    self.serial_read_time_ms = frame.read_time_ms;
+                    self.jpeg_size_kb = frame.jpeg_size as f32 / 1024.0;
+
+                    // Phase 5: Motion detection
+                    if self.motion_config.enabled {
+                        use image::RgbaImage;
+
+                        if let Some(rgba_img) = RgbaImage::from_raw(frame.width, frame.height, frame.pixels) {
+                            let motion_detected = self.motion_detector.detect(&rgba_img);
+
+                            match &mut self.recording_state {
+                                RecordingState::Idle => {
+                                    if motion_detected {
+                                        if let Err(e) = self.start_motion_recording() {
+                                            error!("Failed to start motion recording: {}", e);
+                                        }
+                                    }
+                                }
+                                RecordingState::MotionRecording { motion_active, countdown_frames, .. } => {
+                                    if motion_detected {
+                                        *motion_active = true;
+                                        *countdown_frames = self.motion_config.post_record_seconds * 11;
+                                        self.last_motion_time = Some(Instant::now());
+                                    } else {
+                                        *motion_active = false;
+                                        if *countdown_frames > 0 {
+                                            *countdown_frames -= 1;
+                                        } else {
+                                            if let Err(e) = self.stop_recording() {
+                                                error!("Failed to stop motion recording: {}", e);
+                                            }
+                                        }
+                                    }
+                                }
+                                RecordingState::ManualRecording { .. } => {}
+                            }
+                        }
+                    }
+                }
+                PipelineMessage::Metrics(metrics) => {
+                    // Debug: Log Metrics reception
+                    info!("📊 GUI received Metrics: cam_frames={}, dropped={}, q_depth={}",
+                          metrics.camera_frames, metrics.dropped_frames, metrics.action_q_depth);
+
+                    // Phase 4.1/7/7.3.3: Update Spresense-side metrics
+                    self.spresense_camera_frames = Some(metrics.camera_frames);
+                    self.spresense_camera_fps = Some(metrics.camera_fps);
+                    self.spresense_action_q_depth = Some(metrics.action_q_depth);
+                    self.spresense_errors = Some(metrics.errors);
+                    self.tcp_avg_send_ms = Some(metrics.tcp_avg_send_us as f32 / 1000.0);
+                    self.tcp_max_send_ms = Some(metrics.tcp_max_send_us as f32 / 1000.0);
+                    self.dropped_frames = Some(metrics.dropped_frames);
+                    self.drop_events = Some(metrics.drop_events);
+
+                    // Phase 8: Log metrics to CSV
+                    if let Some(ref logger) = self.metrics_logger {
+                        let perf_metrics = PerformanceMetrics {
+                            timestamp: std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .unwrap_or_default()
+                                .as_secs_f64(),
+                            pc_fps: self.fps,
+                            spresense_fps: self.spresense_fps,
+                            frame_count: self.frame_count,
+                            error_count: self.error_count,
+                            decode_time_ms: self.decode_time_ms,
+                            serial_read_time_ms: self.serial_read_time_ms,
+                            texture_upload_time_ms: self.texture_upload_time_ms,
+                            jpeg_size_kb: self.jpeg_size_kb,
+                            spresense_camera_frames: metrics.camera_frames,
+                            spresense_camera_fps: metrics.camera_fps,
+                            spresense_usb_packets: metrics.usb_packets,
+                            action_q_depth: metrics.action_q_depth,
+                            spresense_errors: metrics.errors,
+                            tcp_avg_send_ms: metrics.tcp_avg_send_us as f32 / 1000.0,
+                            tcp_max_send_ms: metrics.tcp_max_send_us as f32 / 1000.0,
+                            dropped_frames: metrics.dropped_frames,
+                            drop_events: metrics.drop_events,
+                            tcp_health_moving_avg_ms: metrics.tcp_health_moving_avg_ms,  // Phase 9.2
+                            tcp_health_total_spikes: metrics.tcp_health_total_spikes,    // Phase 9.2
+                        };
+                        if let Err(e) = logger.log(&perf_metrics) {
+                            error!("Failed to log metrics: {}", e);
+                        } else {
+                            info!("📝 Metrics logged to CSV");
+                        }
+                    } else {
+                        warn!("⚠️ MetricsLogger is None - CSV logging disabled");
+                    }
+                }
+                PipelineMessage::JpegData(jpeg_data) => {
+                    // Phase 5: Add to ring buffer
+                    if self.motion_config.enabled {
+                        self.ring_buffer.push(JpegFrame {
+                            jpeg_data: jpeg_data.clone(),
+                            timestamp: Instant::now(),
+                        });
+                    }
+
+                    // Phase 3/5: Write JPEG frame to recording
+                    if let Err(e) = self.write_frame(&jpeg_data) {
+                        error!("Failed to write recording frame: {}", e);
+                    }
+                }
+                PipelineMessage::Stats { fps, spresense_fps, frame_count, errors, decode_time_ms, read_time_ms, jpeg_size_kb } => {
+                    self.fps = fps;
+                    self.spresense_fps = spresense_fps;
+                    self.frame_count = frame_count;
+                    self.error_count = errors;
+                    self.decode_time_ms = decode_time_ms;
+                    self.serial_read_time_ms = read_time_ms;
+                    self.jpeg_size_kb = jpeg_size_kb;
+                }
+                PipelineMessage::ConnectionStatus(status) => {
+                    self.connection_status = status;
+                }
+                PipelineMessage::Error(err) => {
+                    error!("Pipeline error: {}", err);
+                    self.connection_status = format!("Error: {}", err);
+                    // Auto-stop on error
+                    *self.is_running.lock().unwrap() = false;
+                }
+            }
+        }
+
+        // Legacy: Process messages from old channel (for compatibility during transition)
         while let Ok(msg) = self.rx.try_recv() {
             match msg {
                 AppMessage::NewFrame(jpeg_data) => {
@@ -510,12 +850,18 @@ impl CameraApp {
                     self.texture_upload_time_ms = texture_upload_time_ms;
                     self.jpeg_size_kb = jpeg_size_kb;
                 }
-                AppMessage::SpresenseMetrics { timestamp_ms: _, camera_frames, camera_fps, usb_packets: _, action_q_depth, avg_packet_size: _, errors } => {
-                    // Phase 4.1: Update Spresense-side metrics
+                AppMessage::SpresenseMetrics { timestamp_ms: _, camera_frames, camera_fps, usb_packets: _, action_q_depth, avg_packet_size: _, errors, tcp_avg_send_us, tcp_max_send_us, dropped_frames, drop_events, tcp_health_moving_avg_ms, tcp_health_total_spikes } => {
+                    // Phase 4.1/7/7.3.3/9.2: Update Spresense-side metrics
                     self.spresense_camera_frames = Some(camera_frames);
                     self.spresense_camera_fps = Some(camera_fps);
                     self.spresense_action_q_depth = Some(action_q_depth);
                     self.spresense_errors = Some(errors);
+                    self.tcp_avg_send_ms = Some(tcp_avg_send_us as f32 / 1000.0);  // Convert μs to ms
+                    self.tcp_max_send_ms = Some(tcp_max_send_us as f32 / 1000.0);  // Convert μs to ms
+                    self.dropped_frames = Some(dropped_frames);      // Phase 7.3.3
+                    self.drop_events = Some(drop_events);            // Phase 7.3.3
+                    self.tcp_health_moving_avg_ms = Some(tcp_health_moving_avg_ms);  // Phase 9.2
+                    self.tcp_health_total_spikes = Some(tcp_health_total_spikes);    // Phase 9.2
                 }
                 AppMessage::JpegFrame(jpeg_data) => {
                     // Phase 5: Add to ring buffer (if motion detection enabled)
@@ -660,6 +1006,28 @@ impl eframe::App for CameraApp {
                 } else {
                     ui.label("⚠ Sp Errors: --");
                 }
+                ui.separator();
+
+                // Phase 7.3.3: Frame drop statistics
+                if let Some(dropped) = self.dropped_frames {
+                    if dropped > 0 {
+                        ui.colored_label(egui::Color32::YELLOW, format!("🗑 Dropped: {}", dropped));
+                    } else {
+                        ui.label(format!("🗑 Dropped: {}", dropped));
+                    }
+                } else {
+                    ui.label("🗑 Dropped: --");
+                }
+                ui.separator();
+                if let Some(events) = self.drop_events {
+                    if events > 0 {
+                        ui.colored_label(egui::Color32::YELLOW, format!("📉 Drop Evts: {}", events));
+                    } else {
+                        ui.label(format!("📉 Drop Evts: {}", events));
+                    }
+                } else {
+                    ui.label("📉 Drop Evts: --");
+                }
 
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.hyperlink_to("GitHub", "https://github.com/");
@@ -672,11 +1040,41 @@ impl eframe::App for CameraApp {
             ui.heading("⚙ Settings");
             ui.separator();
 
-            ui.checkbox(&mut self.auto_detect, "Auto-detect Spresense");
+            // Phase 7: Transport type selection
+            ui.label("Connection Type:");
+            ui.horizontal(|ui| {
+                ui.radio_value(&mut self.transport_type, TransportType::UsbSerial, "USB Serial");
+                ui.radio_value(&mut self.transport_type, TransportType::WiFi, "WiFi");
+            });
 
-            if !self.auto_detect {
-                ui.label("Serial Port:");
-                ui.text_edit_singleline(&mut self.port_path);
+            ui.add_space(5.0);
+
+            // Phase 7.3.3: Error handling mode
+            ui.label("Error Handling:");
+            ui.horizontal(|ui| {
+                ui.radio_value(&mut self.error_handling_mode, ErrorHandlingMode::Production, "🟢 Production");
+                ui.radio_value(&mut self.error_handling_mode, ErrorHandlingMode::Debug, "🔴 Debug");
+            });
+            ui.label(format!("  {}", self.error_handling_mode.as_str()));
+
+            ui.add_space(5.0);
+
+            // USB Serial settings
+            if self.transport_type == TransportType::UsbSerial {
+                ui.checkbox(&mut self.auto_detect, "Auto-detect Spresense");
+                if !self.auto_detect {
+                    ui.label("Serial Port:");
+                    ui.text_edit_singleline(&mut self.port_path);
+                }
+            }
+            // WiFi settings
+            else if self.transport_type == TransportType::WiFi {
+                ui.label("Spresense IP Address:");
+                ui.text_edit_singleline(&mut self.wifi_host);
+
+                ui.add_space(3.0);
+                ui.label("Port:");
+                ui.add(egui::DragValue::new(&mut self.wifi_port).clamp_range(1..=65535));
             }
 
             ui.separator();
@@ -744,7 +1142,12 @@ impl eframe::App for CameraApp {
 
             ui.separator();
             ui.label("💡 Tips:");
-            ui.label("• Connect Spresense via USB");
+            if self.transport_type == TransportType::UsbSerial {
+                ui.label("• Connect Spresense via USB");
+            } else {
+                ui.label("• Connect Spresense to WiFi");
+                ui.label("• Enter Spresense IP address");
+            }
             ui.label("• Click Start to begin");
             ui.label("• Motion rec = auto start");
         });
@@ -774,46 +1177,140 @@ impl eframe::App for CameraApp {
     }
 }
 
+// Phase 7: Connection abstraction for Serial/TCP
+enum Connection {
+    Serial(SerialConnection),
+    Tcp(TcpConnection),
+}
+
+impl Connection {
+    fn read_packet(&mut self) -> io::Result<Packet> {
+        match self {
+            Connection::Serial(serial) => serial.read_packet(),
+            Connection::Tcp(tcp) => {
+                // Read raw packet from TCP (Phase 7.2c: Increased to 250KB for safety margin)
+                let mut buffer = vec![0u8; 250_000];
+                let size = tcp.read_packet(&mut buffer)?;
+                buffer.truncate(size);
+
+                // Parse packet based on sync word
+                if size < 4 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "Packet too small",
+                    ));
+                }
+
+                use byteorder::{ByteOrder, LittleEndian};
+                let sync_word = LittleEndian::read_u32(&buffer[0..4]);
+
+                match sync_word {
+                    protocol::SYNC_WORD => {
+                        // MJPEG packet
+                        let mjpeg_packet = protocol::MjpegPacket::parse(&buffer)?;
+                        Ok(Packet::Mjpeg(mjpeg_packet))
+                    }
+                    protocol::METRICS_SYNC_WORD => {
+                        // Metrics packet
+                        let metrics_packet = protocol::MetricsPacket::parse(&buffer)?;
+                        Ok(Packet::Metrics(metrics_packet))
+                    }
+                    protocol::MJPEG_BATCH_SYNC_WORD => {
+                        // Batch packet (Phase 7.2a: Multi-frame batching)
+                        let batch_packet = protocol::BatchPacket::parse(&buffer)?;
+                        Ok(Packet::Batch(batch_packet))
+                    }
+                    _ => Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("Unknown sync word: 0x{:08X}", sync_word),
+                    )),
+                }
+            }
+        }
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        match self {
+            Connection::Serial(serial) => serial.flush(),
+            Connection::Tcp(_) => Ok(()), // TCP doesn't need flush
+        }
+    }
+
+    fn connection_info(&self) -> String {
+        match self {
+            Connection::Serial(_) => "USB Serial".to_string(),
+            Connection::Tcp(tcp) => tcp.connection_info(),
+        }
+    }
+}
+
 fn capture_thread(
     tx: Sender<AppMessage>,
     is_running: Arc<Mutex<bool>>,
     is_recording: Arc<AtomicBool>,
     port_path: String,
     auto_detect: bool,
+    transport_type: TransportType,  // Phase 7: WiFi support
+    wifi_host: String,
+    wifi_port: u16,
+    error_handling_mode: ErrorHandlingMode,  // Phase 7.3.3: Error handling mode
 ) {
-    info!("Capture thread started");
+    info!("Capture thread started (transport: {:?}, error_handling: {:?})", transport_type, error_handling_mode);
 
-    // Connect to serial port
-    let mut serial = if auto_detect {
-        tx.send(AppMessage::ConnectionStatus("Connecting (auto-detect)...".to_string())).ok();
-        match SerialConnection::auto_detect() {
-            Ok(s) => {
-                tx.send(AppMessage::ConnectionStatus("Connected".to_string())).ok();
-                s
-            }
-            Err(e) => {
-                error!("Failed to auto-detect: {}", e);
-                tx.send(AppMessage::ConnectionStatus(format!("Error: {}", e))).ok();
-                return;
-            }
+    // Phase 7: Connect based on transport type
+    let mut connection = match transport_type {
+        TransportType::UsbSerial => {
+            // USB Serial connection (Phase 1-6)
+            let serial = if auto_detect {
+                tx.send(AppMessage::ConnectionStatus("Connecting (auto-detect)...".to_string())).ok();
+                match SerialConnection::auto_detect() {
+                    Ok(s) => {
+                        tx.send(AppMessage::ConnectionStatus("Connected".to_string())).ok();
+                        s
+                    }
+                    Err(e) => {
+                        error!("Failed to auto-detect: {}", e);
+                        tx.send(AppMessage::ConnectionStatus(format!("Error: {}", e))).ok();
+                        return;
+                    }
+                }
+            } else {
+                tx.send(AppMessage::ConnectionStatus(format!("Connecting to {}...", port_path))).ok();
+                match SerialConnection::open(&port_path, 115200) {
+                    Ok(s) => {
+                        tx.send(AppMessage::ConnectionStatus("Connected".to_string())).ok();
+                        s
+                    }
+                    Err(e) => {
+                        error!("Failed to open port: {}", e);
+                        tx.send(AppMessage::ConnectionStatus(format!("Error: {}", e))).ok();
+                        return;
+                    }
+                }
+            };
+            Connection::Serial(serial)
         }
-    } else {
-        tx.send(AppMessage::ConnectionStatus(format!("Connecting to {}...", port_path))).ok();
-        match SerialConnection::open(&port_path, 115200) {
-            Ok(s) => {
-                tx.send(AppMessage::ConnectionStatus("Connected".to_string())).ok();
-                s
-            }
-            Err(e) => {
-                error!("Failed to open port: {}", e);
-                tx.send(AppMessage::ConnectionStatus(format!("Error: {}", e))).ok();
-                return;
+        TransportType::WiFi => {
+            // WiFi TCP connection (Phase 7)
+            tx.send(AppMessage::ConnectionStatus(format!("Connecting to {}:{}...", wifi_host, wifi_port))).ok();
+            match TcpConnection::new(&wifi_host, wifi_port) {
+                Ok(tcp) => {
+                    let info = tcp.connection_info();
+                    tx.send(AppMessage::ConnectionStatus(format!("Connected: {}", info))).ok();
+                    info!("TCP connected: {}", info);
+                    Connection::Tcp(tcp)
+                }
+                Err(e) => {
+                    error!("Failed to connect to TCP server: {}", e);
+                    tx.send(AppMessage::ConnectionStatus(format!("Error: {}", e))).ok();
+                    return;
+                }
             }
         }
     };
 
     // Flush buffer
-    if let Err(e) = serial.flush() {
+    if let Err(e) = connection.flush() {
         error!("Failed to flush: {}", e);
     }
 
@@ -870,10 +1367,22 @@ fn capture_thread(
     let mut spresense_action_q_depth = 0u32;
     let mut spresense_errors = 0u32;
 
+    // Phase 7: TCP performance metrics (from Metrics packets)
+    let mut tcp_avg_send_ms = 0.0f32;
+    let mut tcp_max_send_ms = 0.0f32;
+
+    // Phase 7.3.3: Frame drop statistics (from Metrics packets)
+    let mut dropped_frames = 0u32;
+    let mut drop_events = 0u32;
+
+    // Phase 9.2: TCP health metrics (from Metrics packets)
+    let mut tcp_health_moving_avg_ms = 0u32;
+    let mut tcp_health_total_spikes = 0u32;
+
     while *is_running.lock().unwrap() {
-        // Measure serial read time
+        // Measure read time (serial or TCP)
         let read_start = Instant::now();
-        let read_result = serial.read_packet();
+        let read_result = connection.read_packet();
         let serial_read_time_ms = read_start.elapsed().as_secs_f32() * 1000.0;
 
         match read_result {
@@ -995,6 +1504,15 @@ fn capture_thread(
                             spresense_usb_packets,
                             action_q_depth: spresense_action_q_depth,
                             spresense_errors,
+                            // Phase 7: TCP performance metrics
+                            tcp_avg_send_ms,
+                            tcp_max_send_ms,
+                            // Phase 7.3.3: Frame drop statistics
+                            dropped_frames,
+                            drop_events,
+                            // Phase 9.2: TCP health metrics
+                            tcp_health_moving_avg_ms,
+                            tcp_health_total_spikes,
                         };
 
                         if let Err(e) = logger.log(&metrics) {
@@ -1024,6 +1542,18 @@ fn capture_thread(
                 spresense_action_q_depth = metrics.action_q_depth;
                 spresense_errors = metrics.errors;
 
+                // Phase 7: Update TCP performance metrics
+                tcp_avg_send_ms = metrics.tcp_avg_send_us as f32 / 1000.0;  // Convert μs to ms
+                tcp_max_send_ms = metrics.tcp_max_send_us as f32 / 1000.0;  // Convert μs to ms
+
+                // Phase 7.3.3: Update frame drop statistics
+                dropped_frames = metrics.dropped_frames;
+                drop_events = metrics.drop_events;
+
+                // Phase 9.2: Update TCP health metrics
+                tcp_health_moving_avg_ms = metrics.tcp_health_moving_avg_ms;
+                tcp_health_total_spikes = metrics.tcp_health_total_spikes;
+
                 info!("Received Spresense metrics: frames={}, fps={:.1}, usb_pkts={}, q_depth={}, errors={}",
                       metrics.camera_frames, camera_fps, metrics.usb_packets,
                       metrics.action_q_depth, metrics.errors);
@@ -1036,25 +1566,180 @@ fn capture_thread(
                     action_q_depth: metrics.action_q_depth,
                     avg_packet_size: metrics.avg_packet_size,
                     errors: metrics.errors,
+                    tcp_avg_send_us: metrics.tcp_avg_send_us,
+                    tcp_max_send_us: metrics.tcp_max_send_us,
+                    dropped_frames: metrics.dropped_frames,                   // Phase 7.3.3
+                    drop_events: metrics.drop_events,                         // Phase 7.3.3
+                    tcp_health_moving_avg_ms: metrics.tcp_health_moving_avg_ms, // Phase 9.2
+                    tcp_health_total_spikes: metrics.tcp_health_total_spikes,   // Phase 9.2
                 }).ok();
             }
-            Err(e) => {
-                if e.kind() != std::io::ErrorKind::TimedOut {
-                    // Phase 4.1.1: Track packet read errors separately
-                    packet_error_count += 1;
-                    error!("Packet read error: {}", e);
+            Ok(Packet::Batch(batch)) => {
+                // Phase 7.2a: Batch packet - process multiple frames
+                packet_error_count = 0;
 
-                    if packet_error_count >= 10 {
-                        error!("Too many consecutive packet errors ({}), stopping capture thread", packet_error_count);
-                        tx.send(AppMessage::ConnectionStatus("Too many packet errors".to_string())).ok();
+                info!("Batch packet: batch_seq={}, frames={}, total_size={} bytes",
+                      batch.header.batch_sequence,
+                      batch.header.frame_count,
+                      batch.header.total_size);
+
+                // Process each frame in the batch
+                for frame in batch.frames.iter() {
+                    frame_count += 1;
+                    frames_since_last_stats += 1;
+
+                    // Update Spresense FPS from frame sequence number
+                    let current_spresense_fps = spresense_fps_calc.update(frame.metadata.frame_sequence);
+
+                    // Accumulate JPEG size
+                    let jpeg_size_bytes = frame.jpeg_data.len();
+                    total_jpeg_size_bytes += jpeg_size_bytes as u64;
+
+                    // Phase 3: Send JPEG data for recording ONLY when recording is active
+                    if is_recording.load(Ordering::Relaxed) {
+                        tx.send(AppMessage::JpegFrame(frame.jpeg_data.clone())).ok();
+                    }
+
+                    // Decode JPEG in capture thread
+                    let decode_start = Instant::now();
+                    match image::load_from_memory(&frame.jpeg_data) {
+                        Ok(img) => {
+                            consecutive_jpeg_errors = 0;
+
+                            let decode_time_ms = decode_start.elapsed().as_secs_f32() * 1000.0;
+                            total_decode_time_ms += decode_time_ms;
+
+                            // Convert to RGBA8
+                            let rgba = img.to_rgba8();
+                            let width = img.width();
+                            let height = img.height();
+                            let pixels = rgba.into_raw();
+
+                            // Send pre-decoded frame to GUI
+                            tx.send(AppMessage::DecodedFrame {
+                                width,
+                                height,
+                                pixels,
+                            }).ok();
+                        }
+                        Err(e) => {
+                            error!("Failed to decode JPEG from batch: {}", e);
+                            jpeg_decode_error_count += 1;
+                            consecutive_jpeg_errors += 1;
+
+                            if consecutive_jpeg_errors == 5 {
+                                warn!("5 consecutive JPEG decode errors detected");
+                            } else if consecutive_jpeg_errors >= 10 {
+                                error!("10+ consecutive JPEG decode errors - check Spresense");
+                            }
+                        }
+                    }
+                }
+
+                // Update statistics every second
+                let now = Instant::now();
+                let elapsed = now.duration_since(last_stats_time).as_secs_f32();
+                if elapsed >= 1.0 {
+                    let fps = frames_since_last_stats as f32 / elapsed;
+
+                    avg_decode_time_ms = total_decode_time_ms / frames_since_last_stats as f32;
+                    avg_serial_read_time_ms = total_serial_read_time_ms / frames_since_last_stats as f32;
+                    avg_jpeg_size_kb = (total_jpeg_size_bytes as f32 / frames_since_last_stats as f32) / 1024.0;
+                    avg_spresense_fps = spresense_fps_calc.current_fps();
+
+                    tx.send(AppMessage::Stats {
+                        fps,
+                        spresense_fps: avg_spresense_fps,
+                        frame_count,
+                        errors: jpeg_decode_error_count,
+                        decode_time_ms: avg_decode_time_ms,
+                        serial_read_time_ms: avg_serial_read_time_ms,
+                        texture_upload_time_ms: 0.0,
+                        jpeg_size_kb: avg_jpeg_size_kb,
+                    }).ok();
+
+                    // Log metrics to CSV
+                    if let Some(ref logger) = metrics_logger {
+                        let metrics = PerformanceMetrics {
+                            timestamp: std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .unwrap()
+                                .as_secs_f64(),
+                            pc_fps: fps,
+                            spresense_fps: avg_spresense_fps,
+                            frame_count,
+                            error_count: jpeg_decode_error_count,
+                            decode_time_ms: avg_decode_time_ms,
+                            serial_read_time_ms: avg_serial_read_time_ms,
+                            texture_upload_time_ms: 0.0,
+                            jpeg_size_kb: avg_jpeg_size_kb,
+                            spresense_camera_frames,
+                            spresense_camera_fps,
+                            spresense_usb_packets,
+                            action_q_depth: spresense_action_q_depth,
+                            spresense_errors,
+                            tcp_avg_send_ms,
+                            tcp_max_send_ms,
+                            dropped_frames,
+                            drop_events,
+                            // Phase 9.2: TCP health metrics
+                            tcp_health_moving_avg_ms,
+                            tcp_health_total_spikes,
+                        };
+
+                        if let Err(e) = logger.log(&metrics) {
+                            error!("Failed to log metrics: {}", e);
+                        }
+                    }
+
+                    // Reset accumulators
+                    frames_since_last_stats = 0;
+                    total_decode_time_ms = 0.0;
+                    total_serial_read_time_ms = 0.0;
+                    total_jpeg_size_bytes = 0;
+                    last_stats_time = now;
+                }
+            }
+            Err(e) => {
+                // Phase 7.3.3: Distinguish between connection errors and packet errors
+                match e.kind() {
+                    // Connection errors: Always stop (both Production and Debug mode)
+                    std::io::ErrorKind::UnexpectedEof |
+                    std::io::ErrorKind::ConnectionReset |
+                    std::io::ErrorKind::ConnectionAborted |
+                    std::io::ErrorKind::BrokenPipe |
+                    std::io::ErrorKind::NotConnected => {
+                        error!("Connection closed: {} (error kind: {:?})", e, e.kind());
+                        tx.send(AppMessage::ConnectionStatus(format!("Connection closed: {}", e))).ok();
                         break;
                     }
 
-                    // Brief pause before retry to allow device to recover
-                    std::thread::sleep(std::time::Duration::from_millis(10));
-                } else {
-                    // Timeout is not counted as an error (device may be slow)
-                    // Continue to next iteration
+                    // Timeout: Not an error (device may be slow)
+                    std::io::ErrorKind::TimedOut => {
+                        // Continue to next iteration
+                    }
+
+                    // Packet/data errors: Mode-dependent behavior
+                    _ => {
+                        packet_error_count += 1;
+                        error!("Packet read error: {} (error kind: {:?})", e, e.kind());
+
+                        if packet_error_count >= 10 {
+                            if error_handling_mode.is_debug() {
+                                // Debug mode: Stop on critical errors
+                                error!("Too many consecutive packet errors ({}), stopping capture thread (Debug mode)", packet_error_count);
+                                tx.send(AppMessage::ConnectionStatus("Too many packet errors".to_string())).ok();
+                                break;
+                            } else {
+                                // Production mode: Log and continue
+                                warn!("Too many consecutive packet errors ({}), continuing (Production mode)", packet_error_count);
+                                // Don't break - continue operation for continuous running
+                            }
+                        }
+
+                        // Brief pause before retry to allow device to recover
+                        std::thread::sleep(std::time::Duration::from_millis(10));
+                    }
                 }
             }
         }
@@ -1065,7 +1750,10 @@ fn capture_thread(
 }
 
 fn main() -> Result<(), eframe::Error> {
-    env_logger::init();
+    // Initialize logger with INFO level by default (not just ERROR)
+    env_logger::Builder::from_default_env()
+        .filter_level(log::LevelFilter::Info)
+        .init();
 
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
