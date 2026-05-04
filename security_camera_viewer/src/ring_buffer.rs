@@ -50,6 +50,14 @@ impl RingBuffer {
         Self::new(capacity)
     }
 
+    /// バッファ内の全フレームを古い順に走査するイテレータを返す。
+    ///
+    /// X-3 監査時に発見した既存の build break を解消する目的で追加。
+    /// 呼出: `gui_main.rs:472` の motion 録画 pre-buffer flush。
+    pub fn iter_frames(&self) -> std::collections::vec_deque::Iter<'_, JpegFrame> {
+        self.frames.iter()
+    }
+
     /// 新しいフレームを追加
     ///
     /// 容量を超える場合、最も古いフレームを自動削除する。

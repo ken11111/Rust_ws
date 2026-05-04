@@ -6,6 +6,7 @@ mod ring_buffer;
 mod motion_detector;
 mod mp4_recorder;
 mod pipeline;  // Phase 8: 3-thread pipeline optimization
+mod ui_tokens; // X-5d / Design System: tokens + ConnState + paint_hud
 
 use eframe::egui;
 use log::{error, info, warn};
@@ -1152,7 +1153,7 @@ impl eframe::App for CameraApp {
             ui.label("• Motion rec = auto start");
         });
 
-        // Central panel - Video display
+        // Central panel - Video display + X-5d OSD HUD
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.vertical_centered(|ui| {
                 if let Some(texture) = &self.current_frame {
@@ -1162,12 +1163,49 @@ impl eframe::App for CameraApp {
                     let scale = (available_size.x / img_size.x).min(available_size.y / img_size.y);
                     let display_size = img_size * scale * 0.95; // 95% to leave some margin
 
-                    ui.add(egui::Image::new(texture).fit_to_exact_size(display_size));
+                    let response = ui.add(egui::Image::new(texture).fit_to_exact_size(display_size));
+
+                    // X-5d / Design System: HUD overlay
+                    let conn_state = if matches!(&self.recording_state, RecordingState::Idle) {
+                        if self.connection_status.starts_with("Connected") {
+                            ui_tokens::ConnState::Live
+                        } else if self.connection_status.contains("Connecting") {
+                            ui_tokens::ConnState::Link
+                        } else if self.connection_status.contains("Error") || self.connection_status.contains("Failed") {
+                            ui_tokens::ConnState::Fault
+                        } else {
+                            ui_tokens::ConnState::Offline
+                        }
+                    } else {
+                        ui_tokens::ConnState::Live
+                    };
+
+                    let recording_secs = match &self.recording_state {
+                        RecordingState::ManualRecording { start_time, .. }
+                        | RecordingState::MotionRecording { start_time, .. } => {
+                            Some(start_time.elapsed().as_secs())
+                        }
+                        _ => None,
+                    };
+
+                    let now = chrono::Local::now();
+                    let ts = now.format("%Y-%m-%d %H:%M:%S%.3f").to_string();
+
+                    let painter = ui.painter_at(response.rect);
+                    ui_tokens::paint_hud(
+                        &painter,
+                        response.rect,
+                        conn_state,
+                        Some(self.frame_count),
+                        recording_secs,
+                        Some(&ts),
+                    );
                 } else {
                     ui.vertical_centered(|ui| {
                         ui.add_space(100.0);
-                        ui.heading("No camera feed");
-                        ui.label("Click 'Start' to begin capturing");
+                        // Design System §文言: 信号なし · NO SIGNAL
+                        ui.heading("信号なし · NO SIGNAL");
+                        ui.label("接続後、ストリーミング待機中");
                         ui.add_space(20.0);
                         ui.label("📷");
                     });
@@ -1763,8 +1801,12 @@ fn main() -> Result<(), eframe::Error> {
     };
 
     eframe::run_native(
-        "Spresense Security Camera",
+        "SPRESENSE · 防犯カメラ操作コンソール",
         options,
-        Box::new(|cc| Box::new(CameraApp::new(cc))),
+        Box::new(|cc| {
+            // Design System: ダークテーマ + タイポを適用
+            ui_tokens::apply_visuals(&cc.egui_ctx);
+            Box::new(CameraApp::new(cc))
+        }),
     )
 }
