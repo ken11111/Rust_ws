@@ -7,6 +7,7 @@ mod motion_detector;
 mod mp4_recorder;
 mod pipeline;  // Phase 8: 3-thread pipeline optimization
 mod ui_tokens; // X-5d / Design System: tokens + ConnState + paint_hud
+mod recording_browser; // X-5c: recorded MP4 files browser panel
 
 use eframe::egui;
 use log::{error, info, warn};
@@ -204,6 +205,10 @@ struct CameraApp {
     ring_buffer: RingBuffer,
     last_motion_time: Option<Instant>,
 
+    // X-5c: 録画ファイル ブラウザ (アプリ内一覧 + 外部プレーヤー起動)
+    recording_browser: recording_browser::RecordingBrowser,
+    show_recording_browser: bool,
+
     // Phase 6: MP4 recording
     recording_format: RecordingFormat,
     mp4_recorder: Option<Mp4Recorder>,
@@ -262,6 +267,12 @@ impl CameraApp {
             motion_detector: MotionDetector::default(),
             ring_buffer: RingBuffer::from_seconds(10, 11),  // 10秒@11fps
             last_motion_time: None,
+
+            // X-5c: 録画ブラウザ
+            recording_browser: recording_browser::RecordingBrowser::new(
+                PathBuf::from(RECORDING_DIR),
+            ),
+            show_recording_browser: false,
             recording_format: RecordingFormat::default(),
             mp4_recorder: None,
             port_path: "/dev/ttyACM0".to_string(),
@@ -1151,7 +1162,22 @@ impl eframe::App for CameraApp {
             }
             ui.label("• Click Start to begin");
             ui.label("• Motion rec = auto start");
+
+            ui.separator();
+            // X-5c: 録画ブラウザの開閉トグル
+            ui.checkbox(&mut self.show_recording_browser, "ファイル · FILES");
         });
+
+        // X-5c: 録画ファイル ブラウザ (右側 SidePanel, 折畳可)
+        if self.show_recording_browser {
+            egui::SidePanel::right("recording_browser_panel")
+                .resizable(true)
+                .default_width(360.0)
+                .min_width(280.0)
+                .show(ctx, |ui| {
+                    self.recording_browser.ui(ui);
+                });
+        }
 
         // Central panel - Video display + X-5d OSD HUD
         egui::CentralPanel::default().show(ctx, |ui| {
