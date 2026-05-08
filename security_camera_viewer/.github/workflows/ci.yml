@@ -126,7 +126,9 @@ jobs:
         path: target/criterion/
 
   coverage:
-    name: Code Coverage
+    # X-8 Stage 1: 行カバレッジ自動測定 (cargo-llvm-cov, Phase 12.1 完了 2026-05-08)
+    # 旧 cargo-tarpaulin から cargo-llvm-cov に切替 (より正確で高速、rustc 公式機能ベース)
+    name: Code Coverage (cargo-llvm-cov)
     runs-on: ubuntu-latest
 
     steps:
@@ -138,17 +140,36 @@ jobs:
         profile: minimal
         toolchain: stable
         override: true
+        components: llvm-tools-preview
 
-    - name: Install tarpaulin
-      run: cargo install cargo-tarpaulin
+    - name: Install cargo-llvm-cov
+      uses: taiki-e/install-action@cargo-llvm-cov
 
-    - name: Generate coverage
-      run: cargo tarpaulin --verbose --all-features --workspace --timeout 120 --out Xml
+    - name: Generate coverage (LCOV)
+      run: cargo llvm-cov --features gui --workspace --lcov --output-path lcov.info
+
+    - name: Print summary
+      run: cargo llvm-cov --features gui --workspace --summary-only
 
     - name: Upload coverage to Codecov
-      uses: codecov/codecov-action@v3
+      uses: codecov/codecov-action@v4
       with:
-        files: ./cobertura.xml
+        files: ./lcov.info
         flags: unittests
         name: codecov-umbrella
         fail_ci_if_error: false
+
+    - name: Coverage threshold check
+      # 現状ベースライン 16.75% を出発点とし、後退を防ぐ。
+      # Phase 12.1 改訂: TEST_COVERAGE_BASELINE.md v1.1 §Stage 4 の 1 ヶ月目標 = 25%
+      # 段階的にこの値を引き上げる。
+      run: |
+        cargo llvm-cov --features gui --workspace --summary-only 2>&1 | tee summary.txt
+        # 抽出: TOTAL 行から Lines % を取得 (gawk フィールド 10 = Lines Cover)
+        TOTAL_LINE_COV=$(grep '^TOTAL' summary.txt | awk '{print $10}' | tr -d '%')
+        echo "TOTAL line coverage: ${TOTAL_LINE_COV}%"
+        # 16.0 を最低ライン (現状 16.75% ベースラインからの後退検出)
+        awk -v cov="$TOTAL_LINE_COV" 'BEGIN{ exit (cov+0 < 16.0) }' || {
+          echo "::error::Line coverage ${TOTAL_LINE_COV}% is below baseline 16.0%"
+          exit 1
+        }
