@@ -317,3 +317,167 @@ pub fn paint_hud(
         Stroke::new(1.0, stroke_color),
     );
 }
+
+// =============================================================================
+// Tests (X-8 Stage 1 派生: ROI 高い ui_tokens のカバレッジを上げる)
+// =============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn conn_state_dot_color_distinct_per_state() {
+        // 各状態で異なる色になることを確認 (Live と Fault は赤系で似ているが
+        // RGB 値で区別可能)
+        let colors = [
+            ConnState::Offline.dot_color(),
+            ConnState::Link.dot_color(),
+            ConnState::Live.dot_color(),
+            ConnState::Fault.dot_color(),
+        ];
+        // ペアワイズで一意 (LINK = ACCENT を共有してもよいが他とは別)
+        for i in 0..colors.len() {
+            for j in (i + 1)..colors.len() {
+                assert_ne!(
+                    colors[i], colors[j],
+                    "states {} and {} share color",
+                    i, j
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn conn_state_link_uses_accent() {
+        // Design System §振る舞い: LINK は ACCENT (warm amber) と同色
+        assert_eq!(ConnState::Link.dot_color(), ACCENT);
+        assert_eq!(STATUS_LINK, ACCENT);
+    }
+
+    #[test]
+    fn conn_state_label_format_jp_en() {
+        // Design System §文言: "<日本語> · <英大文字>" 形式を維持
+        for state in [
+            ConnState::Offline,
+            ConnState::Link,
+            ConnState::Live,
+            ConnState::Fault,
+        ] {
+            let label = state.label();
+            assert!(label.contains(" · "), "label '{}' missing separator", label);
+            // セパレータ前後に何かしら文字がある
+            let parts: Vec<&str> = label.split(" · ").collect();
+            assert_eq!(parts.len(), 2, "label '{}' is not 2-part", label);
+            assert!(!parts[0].is_empty());
+            assert!(!parts[1].is_empty());
+            // 後半は ASCII 大文字
+            assert!(
+                parts[1].chars().all(|c| c.is_ascii_uppercase()),
+                "second half of '{}' should be uppercase ASCII",
+                label
+            );
+        }
+    }
+
+    #[test]
+    fn spacing_scale_is_4px_based() {
+        // Design System §余白: 4px scale 4, 8, 12, 16, 20, 24, 32, 40
+        let scale = [
+            SPACE_1, SPACE_2, SPACE_3, SPACE_4, SPACE_5, SPACE_6, SPACE_7, SPACE_8,
+        ];
+        for v in scale {
+            assert_eq!((v as i32) % 4, 0, "{} is not 4px-aligned", v);
+        }
+        // 単調増加
+        for w in scale.windows(2) {
+            assert!(w[0] < w[1]);
+        }
+    }
+
+    #[test]
+    fn font_scale_increasing() {
+        // Design System §タイポグラフィ: 11/12/13/14/16/18/22/28
+        let scale = [
+            FONT_TINY,
+            FONT_CAPTION,
+            FONT_BODY_SM,
+            FONT_BODY,
+            FONT_LABEL,
+            FONT_SUBHEAD,
+            FONT_HEAD_SM,
+            FONT_HEAD,
+        ];
+        for w in scale.windows(2) {
+            assert!(w[0] < w[1]);
+        }
+        // 最小値の妥当性 (極端に小さいフォントは UI 不能)
+        assert!(FONT_TINY >= 10.0);
+        assert!(FONT_HEAD <= 64.0);
+    }
+
+    #[test]
+    fn radius_hierarchy() {
+        // 入力欄 < カード < モーダル
+        assert!(RADIUS_INPUT < RADIUS_CARD);
+        assert!(RADIUS_CARD < RADIUS_MODAL);
+    }
+
+    #[test]
+    fn surface_colors_progressively_lighter() {
+        // BG_0 が最も暗い、BG_4 に向けて段階的に明るくなる
+        let surfaces = [BG_0, BG_1, BG_2, BG_3, BG_4];
+        for w in surfaces.windows(2) {
+            // ほぼ単調増加 (各チャネルの平均で比較)
+            let lum_a = (w[0].r() as u32 + w[0].g() as u32 + w[0].b() as u32) / 3;
+            let lum_b = (w[1].r() as u32 + w[1].g() as u32 + w[1].b() as u32) / 3;
+            assert!(lum_a < lum_b, "{:?} should be darker than {:?}", w[0], w[1]);
+        }
+    }
+
+    #[test]
+    fn foreground_colors_progressively_darker() {
+        // FG_1 が最も明るい (主テキスト色), FG_4 に向けて沈む
+        let fgs = [FG_1, FG_2, FG_3, FG_4];
+        for w in fgs.windows(2) {
+            let lum_a = (w[0].r() as u32 + w[0].g() as u32 + w[0].b() as u32) / 3;
+            let lum_b = (w[1].r() as u32 + w[1].g() as u32 + w[1].b() as u32) / 3;
+            assert!(lum_a > lum_b, "{:?} should be lighter than {:?}", w[0], w[1]);
+        }
+    }
+
+    #[test]
+    fn accent_palette_consistency() {
+        // ACCENT_LO < ACCENT < ACCENT_HI (明度で)
+        let lum = |c: Color32| (c.r() as u32 + c.g() as u32 + c.b() as u32) / 3;
+        assert!(lum(ACCENT_LO) < lum(ACCENT));
+        assert!(lum(ACCENT) < lum(ACCENT_HI));
+    }
+
+    #[test]
+    fn status_colors_distinct() {
+        // 5 状態色がペアワイズで異なる
+        let statuses = [
+            STATUS_LIVE,
+            STATUS_READY,
+            STATUS_LINK,
+            STATUS_OFFLINE,
+            STATUS_FAULT,
+        ];
+        for i in 0..statuses.len() {
+            for j in (i + 1)..statuses.len() {
+                assert_ne!(statuses[i], statuses[j]);
+            }
+        }
+    }
+
+    #[test]
+    fn live_and_fault_are_red_family() {
+        // Design System: LIVE = warm red (録画ドット), FAULT = bright red (障害)
+        // 両方とも R チャネルが他チャネルより高いことを期待
+        assert!(STATUS_LIVE.r() > STATUS_LIVE.g());
+        assert!(STATUS_LIVE.r() > STATUS_LIVE.b());
+        assert!(STATUS_FAULT.r() > STATUS_FAULT.g());
+        assert!(STATUS_FAULT.r() > STATUS_FAULT.b());
+    }
+}
