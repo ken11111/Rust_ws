@@ -24,3 +24,9 @@ recovery_test.log
 # OS files
 .DS_Store
 Thumbs.db
+
+# 動作確認で生成された録画データ (再生成可能・容量が大きい)
+**/recordings/
+
+# Windows から持ち込んだ NTFS の残骸
+*:Zone.Identifier
