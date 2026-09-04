@@ -1,0 +1,197 @@
+================================================================================
+  PC側デバッグモード実行手順 (Phase 7.2a TCP接続診断)
+================================================================================
+
+このファイルでは、TCP接続問題を診断するための詳細なデバッグ手順を説明します。
+
+================================================================================
+  方法1: debug_tcp.bat を使う（推奨）
+================================================================================
+
+1. Spresenseを起動してIPアドレスを確認
+   - minicom または PuTTY で Spresense に接続
+   - 以下のコマンドを実行:
+     nsh> gs2200m DESKTOP-GPU979R B54p3530 &
+     nsh> security_camera &
+   - IPアドレスをメモ (例: 192.168.137.247)
+
+2. debug_tcp.bat をダブルクリック
+   - Windowsエクスプローラーで release_windows フォルダを開く
+   - debug_tcp.bat をダブルクリック
+   - 黒い画面（コマンドプロンプト）が開く
+
+3. GUIアプリケーションが起動
+   - Transport Type: TCP を選択
+   - Host: 192.168.137.247 (Spresenseのアドレス)
+   - Port: 8888
+   - "Start Capture" をクリック
+
+4. ログを確認
+   - 黒い画面（コマンドプロンプト）にログが表示される
+   - 以下のようなログを探す:
+     [2026-01-11T...Z INFO security_camera_gui] TCP connected: ...
+     [2026-01-11T...Z ERROR security_camera_gui] Packet read error: ...
+
+5. エラーメッセージをコピー
+   - 黒い画面で右クリック → "すべて選択"
+   - もう一度右クリック → "コピー"
+   - テキストファイルに貼り付けて保存
+
+================================================================================
+  方法2: コマンドプロンプトから手動実行
+================================================================================
+
+1. コマンドプロンプトを開く
+   - Windowsキー + R
+   - "cmd" と入力してEnter
+
+2. release_windows フォルダに移動
+   cd C:\path\to\release_windows
+   (例: cd C:\Users\YourName\Downloads\release_windows)
+
+3. 環境変数を設定
+   set RUST_LOG=debug
+
+4. GUIアプリケーションを実行
+   security_camera_gui.exe
+
+5. TCP接続を試行
+   - GUI で TCP / 192.168.137.247 / 8888 を設定
+   - Start Capture をクリック
+
+6. ログをファイルに保存（オプション）
+   security_camera_gui.exe > debug_log.txt 2>&1
+
+================================================================================
+  方法3: CLIアプリケーションで詳細ログ
+================================================================================
+
+1. コマンドプロンプトを開く
+
+2. 環境変数を設定
+   set RUST_LOG=debug
+
+3. CLIアプリケーションを実行
+   security_camera_viewer.exe --transport tcp --tcp-host 192.168.137.247 --tcp-port 8888 --individual-files --output test_output
+
+4. ログが画面に表示される
+   [DEBUG] ... TCP connection ...
+   [INFO] ... Packet received ...
+   [ERROR] ... Error details ...
+
+5. Ctrl+C で停止
+
+================================================================================
+  重要なログメッセージ
+================================================================================
+
+接続成功時:
+  [INFO] TCP connected: TCP 192.168.137.247:8888 (192.168.137.247:8888)
+  [INFO] Connected successfully
+
+接続エラー時:
+  [ERROR] Failed to connect to TCP server: Connection refused (os error 10061)
+  [ERROR] Failed to connect to TCP server: Connection timed out (os error 10060)
+
+読み取りエラー時:
+  [ERROR] Packet read error: Connection closed while reading batch data
+  [ERROR] Packet read error: Connection closed by server
+  [ERROR] Packet read error: Unknown sync word: 0x...
+
+sync word検索時:
+  [WARN] Sync word found after N bytes skipped
+
+バッチパケット受信時:
+  [INFO] Batch packet: batch_seq=X, frames=Y, total_size=Z bytes
+
+================================================================================
+  診断チェックリスト
+================================================================================
+
+□ Spresense側のログで "Client connected!" が表示されている
+□ Spresense側のログで "TCP send buffer: 262144 bytes" が表示されている
+□ Spresense側のログで "batch_size=2" が表示されている
+□ PC側のログで "TCP connected" が表示されている
+□ PC側のログで "Packet read error" が表示されている場合、エラー内容をメモ
+□ Spresense側のログで "Pre-send check: has_client=1" が表示されている
+□ Spresense側のログで "TCP send successful" または "TCP send failed" が表示されている
+
+================================================================================
+  トラブルシューティング
+================================================================================
+
+問題: GUIが起動しない
+解決策:
+  - Windows Defender を確認（ブロックされている可能性）
+  - 管理者として実行
+  - debug_tcp.bat を右クリック → "管理者として実行"
+
+問題: ログが表示されない
+解決策:
+  - set RUST_LOG=debug が正しく設定されているか確認
+  - echo %RUST_LOG% で確認（"debug" と表示されるはず）
+
+問題: "Connection refused" エラー
+解決策:
+  - Spresenseが security_camera を実行しているか確認
+  - IPアドレスが正しいか確認（Spresenseログの "WiFi connected! IP: ..." を参照）
+  - Windowsファイアウォールを確認
+
+問題: "Connection timed out" エラー
+解決策:
+  - PC と Spresense が同じネットワークにいるか確認
+  - ping 192.168.137.247 で疎通確認
+
+問題: "Connection closed while reading batch data"
+解決策:
+  - Spresense側のログを確認（"TCP send failed" があるか）
+  - バッチサイズを確認（2フレームになっているか）
+  - Spresenseを再起動して再試行
+
+================================================================================
+  ログの提供方法
+================================================================================
+
+問題を報告する際は、以下のログを含めてください：
+
+1. Spresense側のログ（全体）
+   - minicom/PuTTY の画面全体をコピー
+   - 特に以下の行を含める:
+     [CAM] Client connected! ...
+     [CAM] Pre-send check: ...
+     [CAM] Sending batch via TCP: ...
+     [CAM] TCP send successful/failed: ...
+
+2. PC側のログ（エラー部分）
+   - コマンドプロンプトの黒い画面からコピー
+   - 特に以下の行を含める:
+     [INFO] TCP connected: ...
+     [ERROR] Packet read error: ...
+     [WARN] Sync word found after N bytes skipped
+
+3. ネットワーク情報
+   - Spresense IP: (例: 192.168.137.247)
+   - PC IP: ipconfig で確認
+   - ping結果: ping 192.168.137.247
+
+================================================================================
+  期待される正常なログ
+================================================================================
+
+Spresense側:
+  [CAM] Client connected! Starting MJPEG streaming...
+  [CAM] Phase 7.2a: Multi-frame batching enabled (batch_size=2, timeout=100ms)
+  [CAM] Packed batch: seq=0, frames=2, total_size=XXXXX, packet_size=XXXXX
+  [CAM] Pre-send check: has_client=1, batch_size=XXXXX bytes
+  [CAM] Sending batch via TCP: XXXXX bytes
+  [CAM] TCP send successful: XXXXX bytes
+  [CAM] == USB thread exiting (sent 1 batches, 2 frames, XXXXX bytes total) ==
+
+PC側:
+  [INFO] TCP connected: TCP 192.168.137.247:8888
+  [INFO] Batch packet: batch_seq=0, frames=2, total_size=XXXXX bytes
+  [INFO] Progress: 1 batches, 2 frames, XXXXX bytes total
+
+================================================================================
+  End of Debug Instructions
+================================================================================
