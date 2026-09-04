@@ -10,44 +10,99 @@
 
 ## 📅 学習期間：1-2ヶ月（短期集中）
 
+## 📋 **学習成果物一覧（クイックアクセス）**
+
+### **📚 理論基盤ファイル**
+| ファイル名 | 概要 | カテゴリ | 重要度 |
+|-----------|------|---------|--------|
+| [Type-1基礎理論](../02_theory_notes/02_cpu_virtualization/type1_fundamentals.md) | ベアメタル実行とファームウェア移行の詳細フロー | 理論 | ⭐⭐⭐ |
+| [QNXハイパーバイザー分析](../02_theory_notes/01_virtualization_basics/qnx_hypervisor_analysis.md) | QNXハイブリッド構成とType-1比較 | 理論 | ⭐⭐ |
+| [性能評価フレームワーク](../02_theory_notes/01_virtualization_basics/performance_evaluation_framework.md) | 多次元性能観点とリソース設計理論 | 理論 | ⭐⭐⭐ |
+
+### **🧪 実践・実験ファイル**
+| ファイル名 | 概要 | カテゴリ | 重要度 |
+|-----------|------|---------|--------|
+| [リソース配置設計](../04_experiments/01_modifications/resource_allocation_design.md) | CPU・メモリ・I/Oリソース設計手法 | 実践 | ⭐⭐⭐ |
+| [クロスレイヤー測定手法](../04_experiments/03_benchmarks/cross_layer_measurement_methodology.md) | ゲスト-ハイパーバイザー跨ぎ性能測定 | 実践 | ⭐⭐⭐ |
+
+### **🔍 技術洞察ファイル**
+| ファイル名 | 概要 | カテゴリ | 重要度 |
+|-----------|------|---------|--------|
+| [ハイパーバイザー分類洞察](../05_insights/02_technical_discoveries/hypervisor_classification_insights.md) | Type-1/Type-2の深い技術的分析 | 洞察 | ⭐⭐ |
+| [用語解析](../05_insights/01_daily_notes/hypervisor_terminology_analysis.md) | ハイパーバイザー関連用語の正確な理解 | 洞察 | ⭐ |
+
+### **📊 進捗・リソース管理**
+| ファイル名 | 概要 | カテゴリ | 重要度 |
+|-----------|------|---------|--------|
+| [マイルストーン追跡](../07_progress_tracking/milestone_tracker.md) | 学習進捗とマイルストーン管理 | 管理 | ⭐⭐ |
+| [Type-1学習リソース](../06_resources/type1_learning_resources.md) | 学習に使用する技術資料リンク集 | リソース | ⭐ |
+
+---
+
 ## 🏗️ 学習フェーズ
 
 ### Phase 1: Type-1理論基盤構築（1-2週間）
 **目標**: Type-1ハイパーバイザーの理論的基盤を確実に固める
 
-#### Week 1: Type-1仮想化技術の核心
-- [ ] **ベアメタル実行の原理**
+#### Week 1: Type-1仮想化技術の核心 ✅ **完了**
+- [x] **ベアメタル実行の原理**
   - ブートプロセスとハードウェア初期化
   - ファームウェア（UEFI/BIOS）からの移行
   - ハイパーバイザーローダーの仕組み
-- [ ] **CPU仮想化（ハードウェア支援）**
+- [x] **CPU仮想化（ハードウェア支援）**
   - Intel VT-x (VMX) の詳細メカニズム
   - AMD-V (SVM) の詳細メカニズム
   - ARM Virtualization Extensions（MiniVisor重点）
   - 特権レベル管理（Ring -1, EL2）
-- [ ] **メモリ仮想化（Stage-2/EPT）**
+- [x] **メモリ仮想化（Stage-2/EPT）**
   - Extended Page Tables (EPT) の動作原理
   - Nested Page Tables (NPT) の動作原理
   - ARM Stage-2 Page Tables（MiniVisor実装）
   - メモリアクセス時の2段階変換プロセス
-- [ ] **Type-1セキュリティモデル**
+- [x] **Type-1セキュリティモデル**
   - ハイパーバイザーTCB（Trusted Computing Base）
   - Ring -1 / EL2 の特権分離
   - ゲスト間完全分離メカニズム
 
-#### Week 2: Type-1設計アーキテクチャ + 性能理論基盤
-- [ ] **Type-1 vs Type-2 の根本的違い**
+**📚 Week 1作成ファイル**：
+
+| ファイル名 | 概要 | 重要度 |
+|-----------|------|--------|
+| [Week 1完了サマリー](../05_insights/01_daily_notes/week1_completion_summary.md) | Week 1全体の学習成果と理解度評価。ベアメタル実行・ARM仮想化・2段階アドレス変換の習得確認 | ⭐⭐⭐ |
+| [Type-1 vs Type-2実装比較](../04_experiments/01_modifications/type1_vs_type2_comparison.md) | コードレベルでのType-1/Type-2の根本的違い。`#![no_std]`、EL2実行、物理メモリ直接制御の証拠 | ⭐⭐⭐ |
+| [ARM仮想化レジスタ解析](../05_insights/02_technical_discoveries/arm_virtualization_registers.md) | HCR_EL2、SPSR_EL2、ELR_EL2の詳細仕様。MiniVisorでの実装確認とx86との比較 | ⭐⭐⭐ |
+| [ゲストOSメモリ管理視点](../05_insights/02_technical_discoveries/guest_memory_perspective.md) | **重要**：2段階アドレス変換の詳細説明。ゲストOSの「錯覚」とStage-2ページングの透明性 | ⭐⭐⭐ |
+| [Day 3: ARM仮想化拡張](../05_insights/01_daily_notes/week1_day3_hardware_virtualization.md) | VMEntry/VMExitメカニズムとERET命令の実装。Intel VT-x/AMD-Vとの比較分析 | ⭐⭐ |
+| [MiniVisorビルド・テスト](../05_insights/01_daily_notes/minivisor_build_test.md) | MiniVisorの実際のビルド手順と動作確認。ベアメタルバイナリの検証方法 | ⭐⭐ |
+
+#### Week 2: Type-1設計アーキテクチャ + 性能理論基盤 🚀 **進行中**
+- [x] **Type-1 vs Type-2 の根本的違い**
   - アーキテクチャ比較と性能影響
   - 使用ケースと選択基準
   - Type-1が優位な場面の理解
-- [ ] **Type-1設計パターン**
+- [x] **Type-1設計パターン**
   - マイクロハイパーバイザー（MiniVisor）
   - モノリシックハイパーバイザー（ESXi）
   - ハイブリッド型（Hyper-V）
-- [ ] **🆕 性能評価の理論基盤**
+- [x] **🆕 性能評価の理論基盤**
   - 多次元性能観点（CPU・メモリ・I/O・時間軸）
   - ゲスト-ハイパーバイザー跨ぎ性能の概念
   - 仮想化オーバーヘッドの分類と測定方法
+
+**📚 Week 2作成ファイル**：
+
+| ファイル名 | 概要 | 重要度 |
+|-----------|------|--------|
+| [Week 2 Day 1: 設計パターンと性能理論](../05_insights/01_daily_notes/week2_day1_architecture_patterns.md) | Type-1設計パターン3種の比較（マイクロ・モノリシック・ハイブリッド）。多次元性能評価基盤とクロスレイヤー性能概念 | ⭐⭐⭐ |
+| [仮想メモリType-1 vs Type-2差異](../05_insights/02_technical_discoveries/virtual_memory_type1_vs_type2.md) | **重要**：メモリ管理階層数の違い（2段階vs3段階）。ホストOS存在による具体的性能影響の数値分析 | ⭐⭐⭐ |
+| [商用ハイパーバイザー重点機能](../05_insights/02_technical_discoveries/enterprise_hypervisor_focus_areas.md) | **重要**：エンドツーエンド成立の重点領域。VMware・Hyper-V等の差別化戦略と企業価値創出分析 | ⭐⭐⭐ |
+| [SLAメトリクス分析](../05_insights/02_technical_discoveries/sla_metrics_analysis.md) | **重要**：商用SLAメトリクス vs MiniVisor比較。可用性・性能・リソース監視の包括的分析と学習価値 | ⭐⭐⭐ |
+
+**📚 Week 3作成ファイル**：
+
+| ファイル名 | 概要 | 重要度 |
+|-----------|------|--------|
+| [Week 3 Day 1: コア実装解析](../05_insights/01_daily_notes/week3_day1_core_implementation_analysis.md) | MiniVisorベアメタル・ARM仮想化・Stage-2実装の詳細解析。性能測定基盤設計と実装計画 | ⭐⭐⭐ |
 
 ### Phase 2: MiniVisor実装解析 + 基本性能測定（2-3週間）
 **目標**: Type-1ハイパーバイザーの実装を完全に理解し、基本的な性能測定を実装する
